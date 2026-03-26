@@ -606,6 +606,17 @@ def train(args):
 
             # ── logging / vis / checkpoint ──
             ep_stats = ep_tracker.flush()
+            try:
+                solv_stats = vec_env.get_solvability_stats(reset=True)
+                if ep_stats is not None:
+                    ep_stats.update({
+                        'unsolvable_rate': solv_stats['unsolvable_rate'],
+                        'unsolvable_episodes': solv_stats['unsolvable_episodes'],
+                    })
+                elif solv_stats.get('unsolvable_episodes', 0) > 0:
+                    ep_stats = solv_stats
+            except Exception:
+                pass
             should_log_wandb = (args.log_every > 0
                                 and iteration % args.log_every == 0)
             ep_reward = log_metrics(

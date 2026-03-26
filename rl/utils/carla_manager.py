@@ -434,7 +434,8 @@ def _multi_env_worker(pipe, cfg_dict, port, num_agents, max_speed, fps,
                       pedestrian_config=None,
                       navmesh_cache_dir=None,
                       quadrant_margin=None,
-                      randomize_weather=False):
+                      randomize_weather=False,
+                      use_mpc=False):
     """Subprocess that owns one CarlaMultiAgentEnv (N agents on 1 server)."""
     signal.signal(signal.SIGINT, signal.SIG_IGN)
 
@@ -482,6 +483,8 @@ def _multi_env_worker(pipe, cfg_dict, port, num_agents, max_speed, fps,
             quadrant_margin=quadrant_margin,
             randomize_weather=randomize_weather,
         )
+        if not discrete:
+            kwargs['use_mpc'] = use_mpc
         env = EnvClass(**kwargs)
 
     def _safe_reset():
@@ -594,6 +597,14 @@ def _multi_env_worker(pipe, cfg_dict, port, num_agents, max_speed, fps,
                 print(f"[multi-worker port={port}] get_obstacle_layout failed: {e}")
                 pipe.send({'obstacles': [], 'crosswalks': []})
 
+        elif cmd == "get_solvability_stats":
+            try:
+                stats = env.get_solvability_stats(reset=bool(data))
+                pipe.send(stats)
+            except Exception as e:
+                print(f"[multi-worker port={port}] get_solvability_stats failed: {e}")
+                pipe.send(None)
+
         elif cmd == "close":
             break
 
@@ -627,7 +638,8 @@ class VecCarlaMultiAgentEnv:
                  pedestrian_config=None,
                  navmesh_cache_dir=None,
                  quadrant_margin=None,
-                 randomize_weather=False):
+                 randomize_weather=False,
+                 use_mpc=False):
         from omegaconf import OmegaConf
 
         self.cfg_dict = OmegaConf.to_container(cfg, resolve=True)
@@ -649,6 +661,7 @@ class VecCarlaMultiAgentEnv:
         self.navmesh_cache_dir = navmesh_cache_dir
         self.quadrant_margin = quadrant_margin
         self.randomize_weather = randomize_weather
+        self.use_mpc = use_mpc
 
         # Server lifecycle management (for autonomous restart)
         self.carla_bin = carla_bin
@@ -685,7 +698,8 @@ class VecCarlaMultiAgentEnv:
                   self.pedestrian_config,
                   self.navmesh_cache_dir,
                   self.quadrant_margin,
-                  self.randomize_weather),
+                  self.randomize_weather,
+                  self.use_mpc),
             daemon=True,
         )
         p.start()
@@ -973,6 +987,39 @@ class VecCarlaMultiAgentEnv:
             for _ in range(M):
                 flat_layouts.append(server_layouts[server_idx])
         return flat_layouts
+
+    def get_solvability_stats(self, reset=False):
+        """Aggregate solvability stats across all servers.
+
+        Returns a dict with summed counts and recomputed rates.
+        """
+        for i in range(self.num_servers):
+            try:
+                self.pipes[i].send(("get_solvability_stats", reset))
+            except (BrokenPipeError, OSError):
+                pass
+
+        agg = {
+            'solvable_episodes': 0,
+            'unsolvable_episodes': 0,
+            'goal_retries_total': 0,
+        }
+        for i in range(self.num_servers):
+            try:
+                stats = self.pipes[i].recv()
+                if stats is not None:
+                    agg['solvable_episodes'] += stats['solvable_episodes']
+                    agg['unsolvable_episodes'] += stats['unsolvable_episodes']
+                    agg['goal_retries_total'] += stats['goal_retries_total']
+            except (EOFError, BrokenPipeError, OSError):
+                pass
+
+        total = agg['solvable_episodes'] + agg['unsolvable_episodes']
+        agg['unsolvable_rate'] = (
+            agg['unsolvable_episodes'] / total if total > 0 else 0.0)
+        agg['mean_goal_retries'] = (
+            agg['goal_retries_total'] / total if total > 0 else 0.0)
+        return agg
 
     def close(self):
         for i in range(self.num_servers):

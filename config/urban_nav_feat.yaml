@@ -1,6 +1,6 @@
 project:
   name: 'base-model'
-  run_name: 'carla_data'
+  run_name: 'urban_nav_feat_mix'
   result_dir: 'base0325'
 
 training:
@@ -23,7 +23,7 @@ optimizer:
   lr: 2e-4
 
 model:
-  type: 'flow_matching'
+  type: 'flow_matching_feat'
   do_rgb_normalize: true
   do_resize: true
   obs_encoder:
@@ -50,9 +50,7 @@ model:
     num_diffusion_iters: 100
 
 data:
-  type: carla
-  root_dir: '/raid/robot/V0.1_jaeuk'
-  pose_dir: 'camera-to-world'
+  type: urban_nav_feat_mixture
   num_workers: 16
   pose_fps: 2
   video_fps: 2
@@ -60,13 +58,25 @@ data:
   num_train: 1400
   num_val: 50
   num_test: 0
-  input_noise: 0.1 # sigma (after normalization)
-  width: 640
-  height: 480
-  fov: 110.0
-  desired_width: 640
-  desired_height: 360
+  input_noise: 0.1
   horizontal_flip_prob: 0.5
+  mixture:
+    - root: '/path/to/dataset_a'
+      weight: 0.5
+      # num_train: 1000    # per-dataset override (falls back to top-level)
+      # num_val: 25
+      # pose_subdir: pose  # default
+      # feature_subdir: dino  # default
+      # camera:             # per-dataset camera intrinsics (optional)
+      #   width: 640
+      #   height: 480
+      #   fov: 110.0
+      #   desired_width: 640
+      #   desired_height: 360
+    - root: '/path/to/dataset_b'
+      weight: 0.3
+    - root: '/path/to/dataset_c'
+      weight: 0.2
 
 validation:
   num_visualize: 400
@@ -74,5 +84,5 @@ testing:
   num_visualize: 400
 
 logging:
-  enable_wandb: true  # Set to false to disable Wandb logging
+  enable_wandb: true
   pbar_rate: 100

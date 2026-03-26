@@ -97,11 +97,18 @@ class CarlaFeatDataset(Dataset):
         self.feature_paths = [self.feature_paths[i] for i in valid_indices]
         self.count = [self.count[i] for i in valid_indices]
 
-        # Locate raw image directories (optional — used for visualization)
+        # Locate raw image directories (optional — used for visualization).
+        # When cfg.data.rgb_dir is set (e.g. by mixture datamodule), look for
+        # frame directories at {rgb_dir}/{episode_name}/.  Otherwise fall back
+        # to the legacy CARLA layout: {root_dir}/{episode_name}/fcam/.
+        rgb_dir = getattr(cfg.data, 'rgb_dir', None)
         self.image_dirs = []
         for pp in self.pose_path:
             name = os.path.splitext(os.path.basename(pp))[0]
-            img_dir = os.path.join(self.data_dir, name, 'fcam')
+            if rgb_dir:
+                img_dir = os.path.join(rgb_dir, name)
+            else:
+                img_dir = os.path.join(self.data_dir, name, 'fcam')
             self.image_dirs.append(img_dir if os.path.isdir(img_dir) else None)
 
         self.step_scale = []
@@ -122,6 +129,21 @@ class CarlaFeatDataset(Dataset):
             end_idx = idx_counter
             self.video_ranges.append((start_idx, end_idx))
         assert len(self.lut) > 0, "No usable samples found."
+
+        # Camera intrinsics (optional — for image-overlay visualization).
+        # Accepts a nested 'camera' dict or legacy top-level data fields.
+        cam = getattr(cfg.data, 'camera', None)
+        if cam is not None:
+            self._camera = [float(cam['width']), float(cam['height']),
+                            float(cam['fov']), float(cam['desired_width']),
+                            float(cam['desired_height'])]
+        elif all(hasattr(cfg.data, k) for k in
+                 ('width', 'height', 'fov', 'desired_width', 'desired_height')):
+            d = cfg.data
+            self._camera = [float(d.width), float(d.height), float(d.fov),
+                            float(d.desired_width), float(d.desired_height)]
+        else:
+            self._camera = None
 
         # Data augmentation
         self.augment = (mode == 'train')
@@ -247,6 +269,15 @@ class CarlaFeatDataset(Dataset):
                     last_idx = min(frame_indices[-1], len(img_files) - 1)
                     image_path = os.path.join(dirpath, img_files[last_idx])
             sample['image_path'] = image_path
+
+            # Per-sample camera intrinsics for visualization.
+            # Sentinel -1 means "no camera" — keeps keys uniform across
+            # datasets in a ConcatDataset so default collation works.
+            if self._camera is not None:
+                sample['camera_intrinsics'] = torch.tensor(
+                    self._camera, dtype=torch.float32)
+            else:
+                sample['camera_intrinsics'] = torch.full((5,), -1.0)
 
         return sample
 

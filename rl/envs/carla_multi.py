@@ -25,6 +25,7 @@ import gymnasium as gym
 
 import carla
 from carla_utils.tf import UE
+from rl.envs.mpc.mpc import MPC
 from rl.envs.obstacle_manager import ObstacleManager, ObstacleConfig
 from rl.envs.pedestrian_manager import PedestrianManager, PedestrianConfig
 from rl.utils.geodesic import GeodesicDistanceField
@@ -59,7 +60,40 @@ def sample_point_from_annulus(r_min, r_max):
     th = np.pi * (2. * np.random.rand() - 1.)
     p = np.random.rand()
     r = (r_max**2 * (1. - p) + r_min**2 * p) ** 0.5
-    return r * np.array([np.cos(th), np.sin(th)])   
+    return r * np.array([np.cos(th), np.sin(th)])
+
+
+def _repeat_and_shift(data, repeats, shifts):
+    """Upsample waypoints along the temporal axis for MPC horizon alignment.
+
+    (*, data_size, data_dim) -> (*, repeats * data_size, data_dim)
+    then cyclically shift by *shifts* positions.
+    """
+    n_waypoints = data.shape[-2]
+    data_rep = np.repeat(data, repeats=repeats, axis=-2)
+    data_shifted = np.concatenate(
+        (data_rep[..., shifts:, :],
+         data_rep[..., repeats * n_waypoints - shifts:, :]),
+        axis=-2)
+    return data_shifted
+
+
+def _to_walker_control_mpc(velocities, c2w, dt) -> carla.WalkerControl:
+    """Convert MPC unicycle control (lin_v, ang_v) to CARLA WalkerControl."""
+    lin_v, ang_v = velocities
+    th_next = 0.5 * np.pi + dt * ang_v
+    c, s = np.cos(th_next), np.sin(th_next)
+    direction_cam = np.array([c, 0., s])
+    c2w_R = R.from_quat(c2w[3:])
+    direction = c2w_R.apply(direction_cam)
+    x, y, z = direction
+    x, y, z = z, x, -y        # standard -> UE
+    norm = (x**2 + y**2 + z**2)**0.5 + 1e-10
+    x, y, z = x / norm, y / norm, z / norm
+    return carla.WalkerControl(
+        carla.Vector3D(float(x), float(y), float(z)),
+        float(lin_v),
+    )   
 
 
 # ── Multi-agent environment ───────────────────────────────────────────
@@ -91,6 +125,7 @@ class CarlaMultiAgentEnv:
             navmesh_cache: NavmeshCache | None = None,
             quadrant_margin=None,
             randomize_weather=False,
+            use_mpc=False,
             ):
         assert 1 <= num_agents <= 4, "Currently supports 1-4 agents (quadrants)"
 
@@ -105,6 +140,7 @@ class CarlaMultiAgentEnv:
         self.n_skips = int(fps // cfg.data.target_fps)      # number of ticks per step
         self.port = port
         self.teleport = teleport
+        self.use_mpc = use_mpc
         self.max_speed = max_speed
         self.gamma = gamma
         self.goal_range = goal_range
@@ -120,7 +156,21 @@ class CarlaMultiAgentEnv:
 
         # Per-agent gym spaces (for reference; the vectorised API stacks them)
         self.action_space = gym.spaces.Box(
-            low=-max_speed, high=max_speed, shape=(2,), dtype=np.float32)
+            low=-100., high=100., shape=(self.future_length * 2,), dtype=np.float32)
+
+        # MPC: created once and kept alive across resets (JIT compiles on
+        # first solve, so re-creating would incur non-negligible overhead).
+        if self.use_mpc:
+            mpc_horizon = self.future_length * self.n_skips
+            ulb = np.array([-max_speed, -0.8])
+            uub = np.array([max_speed, 0.8])
+            max_wall_time = 2.0 * self.dt
+            self._mpc = MPC(mpc_horizon, self.dt, ulb, uub,
+                            max_wall_time=max_wall_time)
+        else:
+            self._mpc = None
+        self._last_mpc_solve_time = 0.0
+        self._last_sim_tick_time = 0.0
         self.observation_space = gym.spaces.Dict({
             'obs': gym.spaces.Box(0., 255., (self.history_length, height, width, 3), np.uint8),
             'cord': gym.spaces.Box(-100., 100., (self.history_length * 2,), np.float32),
@@ -145,7 +195,8 @@ class CarlaMultiAgentEnv:
         self.sensors: List[list] = [[]] * num_agents
         self.goal_globals = [None] * num_agents             # 2d goal position (standard world coordinate)
         self._goal_methods = [''] * num_agents             # how each goal was sampled
-        self.initial_distances = [0.] * num_agents          # TODO: log this & monitor through wandb
+        self.initial_distances = [0.] * num_agents
+        self.initial_geodesic_distances = [0.] * num_agents
         self.path_lengths = [0.] * num_agents
         self.step_counts = [0] * num_agents
         self.all_actor_ids: List[int] = []
@@ -165,6 +216,13 @@ class CarlaMultiAgentEnv:
         self._geo_grids: list = [None] * num_agents
         self._geo_dists: list = [None] * num_agents
         self._geo_paths: list = [None] * num_agents   # traced geodesic paths (std coords)
+
+        # Episode solvability tracking (cumulative across auto-resets)
+        self._max_goal_retries = 5
+        self._goal_retries_total = 0      # total retries across all episodes
+        self._unsolvable_episodes = 0     # episodes that remained unsolvable after retries
+        self._solvable_episodes = 0       # episodes confirmed solvable
+        self._last_retries = [0] * num_agents  # retries for the most recent episode per agent
 
     # ── VecCarlaEnv-compatible property ───────────────────────────────
 
@@ -530,6 +588,29 @@ class CarlaMultiAgentEnv:
                 return d
         return self._distance_to_goal(agent_idx)
 
+    def _is_episode_solvable(self, agent_idx):
+        """Check whether the current episode is solvable.
+
+        An episode is unsolvable if:
+        1. The goal is geodesically unreachable (disconnected mesh), or
+        2. The geodesic distance exceeds the agent's travel budget
+           (max_speed * sqrt(2) * max_episode_steps).
+
+        Returns ``(solvable, reason)`` where *reason* is ``''`` when
+        solvable, or a short description of why it's not.
+        """
+        geo = self._geo_grids[agent_idx]
+        if geo is None or self._geo_dists[agent_idx] is None:
+            # No geodesic grid available — can't check, assume solvable
+            return True, ''
+        d = geo.query(self._geo_dists[agent_idx], self._get_xz(agent_idx))
+        if not np.isfinite(d):
+            return False, 'unreachable'
+        budget = self.max_speed * math.sqrt(2) * self.max_episode_steps
+        if d > budget:
+            return False, f'too_far(geodesic={d:.1f}m > budget={budget:.1f}m)'
+        return True, ''
+
     # ── Sensor data ───────────────────────────────────────────────────
 
     def _get_sensor_data(self, agent_idx, sensor_id='fcam') -> np.ndarray:
@@ -631,6 +712,78 @@ class CarlaMultiAgentEnv:
                 delta_xz = sample_point_from_annulus(r_min, r_max)
                 self.goal_globals[agent_idx] = xz + delta_xz
 
+    def _sample_solvable_goal(self, agent_idx):
+        """Sample a goal and verify solvability, retrying up to
+        ``_max_goal_retries`` times.
+
+        On each attempt a new goal is sampled via ``_sample_goal``, the
+        geodesic field is recomputed, and ``_is_episode_solvable`` is
+        checked.  If all attempts fail the last sampled goal is kept
+        (best-effort) and the episode is counted as unsolvable.
+
+        Updates ``_last_retries``, ``_goal_retries_total``,
+        ``_solvable_episodes``, and ``_unsolvable_episodes``.
+        """
+        retries = 0
+        for attempt in range(self._max_goal_retries + 1):
+            self._sample_goal(agent_idx)
+            self._update_geodesic(agent_idx)
+            solvable, reason = self._is_episode_solvable(agent_idx)
+            if solvable:
+                break
+            retries += 1
+            if attempt < self._max_goal_retries:
+                print(f'  Agent {agent_idx}: goal unsolvable ({reason}), '
+                      f'resampling (attempt {attempt + 2}/{self._max_goal_retries + 1})')
+
+        self._last_retries[agent_idx] = retries
+        self._goal_retries_total += retries
+        if solvable:
+            self._solvable_episodes += 1
+        else:
+            self._unsolvable_episodes += 1
+            print(f'  Agent {agent_idx}: WARNING — episode unsolvable after '
+                  f'{self._max_goal_retries + 1} attempts ({reason}), '
+                  f'proceeding anyway')
+
+    def _try_crosswalk_or_fallback(self, agent_idx, crosswalk_spawns,
+                                   crosswalk_goal_std):
+        """Set a crosswalk-challenge goal and check solvability.
+
+        If the crosswalk goal is unsolvable, destroy the challenge actors
+        and fall back to ``_sample_solvable_goal`` with normal goal
+        sampling.
+
+        Parameters
+        ----------
+        agent_idx : int
+        crosswalk_spawns : dict
+            Mutable mapping — entry for *agent_idx* is removed on fallback.
+        crosswalk_goal_std : (2,) array
+            Goal in standard coordinates from the crosswalk challenge.
+        """
+        self.goal_globals[agent_idx] = crosswalk_goal_std
+        self._goal_methods[agent_idx] = 'crosswalk_challenge'
+        self.obstacle_mgr._region_scenarios.setdefault(
+            agent_idx, []).append('crosswalk_challenge')
+        self._update_geodesic(agent_idx)
+        solvable, reason = self._is_episode_solvable(agent_idx)
+        if solvable:
+            self._last_retries[agent_idx] = 0
+            self._solvable_episodes += 1
+            return
+
+        # Crosswalk challenge produced an unsolvable episode — tear it
+        # down and fall back to normal goal sampling.
+        print(f'  Agent {agent_idx}: crosswalk challenge unsolvable '
+              f'({reason}), falling back to normal goal')
+        if self._challenge_actor_ids[agent_idx]:
+            self.obstacle_mgr.destroy_actors(
+                self._challenge_actor_ids[agent_idx])
+            self._challenge_actor_ids[agent_idx] = []
+        crosswalk_spawns.pop(agent_idx, None)
+        self._sample_solvable_goal(agent_idx)
+
     # ── Observation / info builders ───────────────────────────────────
 
     def _get_observation(self, agent_idx):
@@ -652,8 +805,10 @@ class CarlaMultiAgentEnv:
             'distance_to_goal': self._distance_to_goal(agent_idx),
             'geodesic_distance_to_goal': self._geodesic_distance_to_goal(agent_idx),
             'initial_distance': self.initial_distances[agent_idx],
+            'initial_geodesic_distance': self.initial_geodesic_distances[agent_idx],
             'path_length': self.path_lengths[agent_idx],
             'is_success': self._distance_to_goal(agent_idx) <= 0.2,
+            'goal_retries': self._last_retries[agent_idx],
             'agent_idx': agent_idx,
         }
         if self._current_weather is not None:
@@ -991,14 +1146,13 @@ class CarlaMultiAgentEnv:
             self._initialize_buffer(i)
             if i in crosswalk_spawns:
                 _, goal_std = crosswalk_spawns[i]
-                self.goal_globals[i] = goal_std
-                self._goal_methods[i] = 'crosswalk_challenge'
-                self.obstacle_mgr._region_scenarios.setdefault(
-                    i, []).append('crosswalk_challenge')
+                self._try_crosswalk_or_fallback(
+                    i, crosswalk_spawns, goal_std)
             else:
-                self._sample_goal(i)
-            self._update_geodesic(i)
+                self._sample_solvable_goal(i)
             self.initial_distances[i] = self._distance_to_goal(i)
+            self.initial_geodesic_distances[i] = \
+                self._geodesic_distance_to_goal(i)
             self.path_lengths[i] = 0.0
             self.step_counts[i] = 0
 
@@ -1013,8 +1167,9 @@ class CarlaMultiAgentEnv:
 
         Parameters
         ----------
-        actions : (num_agents, 2)  float32
-            Per-agent displacement [dx, dz] in the camera frame.
+        actions : (num_agents, future_length * 2)  float32
+            Per-agent waypoints in the camera frame, flattened from
+            (future_length, 2) where each row is [x_cam, z_cam].
 
         Returns  (matches VecCarlaEnv interface)
         -------
@@ -1025,7 +1180,7 @@ class CarlaMultiAgentEnv:
         infos      : list[dict]
         """
         N = self.num_agents
-        assert actions.shape == (N, 2)
+        assert actions.shape == (N, self.future_length * 2)
 
         self._substep_frames = [[] for _ in range(N)]
 
@@ -1034,15 +1189,17 @@ class CarlaMultiAgentEnv:
         phi0 = [self._geodesic_potential(i) for i in range(N)]   # geodesic
         pre_xz = [self._get_xz(i).copy() for i in range(N)]
 
-        # Velocities & command diagnostics
-        vels = []
+        # Parse per-agent waypoints (camera frame)
+        per_agent_waypoints = []
+        for i in range(N):
+            per_agent_waypoints.append(actions[i].reshape(-1, 2))
+
+        # Command diagnostics (based on first waypoint → approximate velocity)
         cmd_infos: List[dict] = []
         for i in range(N):
-            dx, dz = actions[i]
+            dx, dz = per_agent_waypoints[i][0]
             vx = dx / (self.dt * self.n_skips)
             vz = dz / (self.dt * self.n_skips)
-            vels.append((vx, vz))
-
             pose0 = self._get_pose(i)
             cmd_cam = np.array([vx, 0., vz])
             cmd_world = R.from_quat(pose0[3:]).apply(cmd_cam)
@@ -1055,9 +1212,24 @@ class CarlaMultiAgentEnv:
         self._cached_obs_pos_ue = self.obstacle_mgr.get_obstacle_positions_ue()
 
         # ── Execute sub-steps ──
-        if self.teleport:
+        if self.use_mpc:
+            self._step_mpc_all(per_agent_waypoints)
+        elif self.teleport:
+            # Derive velocities from first waypoint for non-MPC modes
+            vels = []
+            for i in range(N):
+                dx, dz = per_agent_waypoints[i][0]
+                vx = dx / (self.dt * self.n_skips)
+                vz = dz / (self.dt * self.n_skips)
+                vels.append((vx, vz))
             self._step_teleport_all(vels)
         else:
+            vels = []
+            for i in range(N):
+                dx, dz = per_agent_waypoints[i][0]
+                vx = dx / (self.dt * self.n_skips)
+                vz = dz / (self.dt * self.n_skips)
+                vels.append((vx, vz))
             self._step_physics_all(vels)
 
         obs_pos_ue = self._cached_obs_pos_ue
@@ -1124,6 +1296,10 @@ class CarlaMultiAgentEnv:
                 'real_vel_xz': real_vel_xz,
                 'real_speed': float(np.linalg.norm(real_vel_xz)),
             })
+            # Timing data (same for all agents on this server)
+            info['sim_tick_time'] = self._last_sim_tick_time
+            if self.use_mpc:
+                info['mpc_solve_time'] = self._last_mpc_solve_time
             if self._collect_substep_frames and self._substep_frames[i]:
                 info['substep_frames'] = np.stack(self._substep_frames[i])
             infos.append(info)
@@ -1206,16 +1382,14 @@ class CarlaMultiAgentEnv:
                     # Fresh observation for the new episode
                     self._initialize_buffer(i)
                     if i in crosswalk_spawns:
-                        # Goal already decided by crosswalk challenge
                         _, goal_std = crosswalk_spawns[i]
-                        self.goal_globals[i] = goal_std
-                        self._goal_methods[i] = 'crosswalk_challenge'
-                        self.obstacle_mgr._region_scenarios.setdefault(
-                            i, []).append('crosswalk_challenge')
+                        self._try_crosswalk_or_fallback(
+                            i, crosswalk_spawns, goal_std)
                     else:
-                        self._sample_goal(i)
-                    self._update_geodesic(i)
+                        self._sample_solvable_goal(i)
                     self.initial_distances[i] = self._distance_to_goal(i)
+                    self.initial_geodesic_distances[i] = \
+                        self._geodesic_distance_to_goal(i)
                     self.path_lengths[i] = 0.0
                     self.step_counts[i] = 0
                 else:
@@ -1245,6 +1419,7 @@ class CarlaMultiAgentEnv:
             dy_ue = float(disp_std[0])
             disps.append((dx_ue, dy_ue))
 
+        sim_tick_time = 0.0
         for _t in range(self.n_skips):
             for i, (dx_ue, dy_ue) in enumerate(disps):
                 tf = self.robots[i].get_transform()
@@ -1256,13 +1431,17 @@ class CarlaMultiAgentEnv:
                 self.robots[i].set_transform(tf)
 
             self.ped_mgr.update(self.dt, self._cached_obs_pos_ue)
+            t_tick0 = time.perf_counter()
             self.world.tick()
+            sim_tick_time += time.perf_counter() - t_tick0
 
             for i in range(self.num_agents):
                 self._update_buffer(i)
                 if self._collect_substep_frames:
                     self._substep_frames[i].append(
                         self.rgb_buffers[i][-1].copy())
+
+        self._last_sim_tick_time = sim_tick_time
 
     def _step_physics_all(self, vels):
         """WalkerControl-based stepping for all agents."""
@@ -1270,18 +1449,106 @@ class CarlaMultiAgentEnv:
         for i, (vx, vz) in enumerate(vels):
             controls.append(_to_walker_control(vx, vz, self._get_pose(i)))
 
+        sim_tick_time = 0.0
         for _t in range(self.n_skips):
             for i, ctrl in enumerate(controls):
                 self.robots[i].apply_control(ctrl)
 
             self.ped_mgr.update(self.dt, self._cached_obs_pos_ue)
+            t_tick0 = time.perf_counter()
             self.world.tick()
+            sim_tick_time += time.perf_counter() - t_tick0
 
             for i in range(self.num_agents):
                 self._update_buffer(i)
                 if self._collect_substep_frames:
                     self._substep_frames[i].append(
                         self.rgb_buffers[i][-1].copy())
+
+        self._last_sim_tick_time = sim_tick_time
+
+    def _step_mpc_all(self, per_agent_waypoints):
+        """MPC-based stepping for all agents.
+
+        Each agent's camera-frame waypoints are converted to absolute world
+        coordinates once (frozen at step start).  At every sub-step the world
+        waypoints are re-projected into the agent's *current* camera frame,
+        up-sampled to the MPC horizon via ``_repeat_and_shift``, and fed to
+        the shared MPC solver.  The first unicycle control ``(v, ω)`` is
+        applied via ``WalkerControl``.
+
+        Parameters
+        ----------
+        per_agent_waypoints : list of (future_length, 2) ndarray
+            Waypoints in each agent's camera frame at step start.
+        """
+        N = self.num_agents
+
+        # Phase 1: convert camera-frame waypoints → absolute world (x_std, z_std)
+        waypoints_world = []
+        for i in range(N):
+            wp_cam = per_agent_waypoints[i]              # (future_length, 2)
+            c2w_R0 = R.from_quat(self._get_pose(i)[3:])
+            xz0 = self._get_xz(i)
+            wp_3d_cam = np.column_stack([
+                wp_cam[:, 0],
+                np.zeros(len(wp_cam)),
+                wp_cam[:, 1],
+            ])
+            wp_3d_world = c2w_R0.apply(wp_3d_cam)
+            waypoints_world.append(wp_3d_world[:, [0, 2]] + xz0)
+
+        # Phase 2: sub-steps with MPC
+        mpc_solve_time = 0.0
+        sim_tick_time = 0.0
+        for t in range(self.n_skips):
+            for i in range(N):
+                # Re-project world waypoints into the current camera frame
+                c2w_R = R.from_quat(self._get_pose(i)[3:])
+                wp_rel = waypoints_world[i] - self._get_xz(i)
+                wp_3d_rel = np.column_stack([
+                    wp_rel[:, 0],
+                    np.zeros(len(wp_rel)),
+                    wp_rel[:, 1],
+                ])
+                wp_cam_3d = c2w_R.inv().apply(wp_3d_rel)
+                waypoints = wp_cam_3d[:, [0, 2]]          # (future_length, 2)
+
+                # Up-sample to MPC horizon and shift for current sub-step
+                cost_weights = np.ones(waypoints.shape[0])
+                cost_weights[0] = 10.0
+                processed_wp = _repeat_and_shift(
+                    data=waypoints, repeats=self.n_skips, shifts=t)
+                processed_cw = np.squeeze(_repeat_and_shift(
+                    data=cost_weights[:, None],
+                    repeats=self.n_skips, shifts=t), axis=-1)
+
+                t_mpc0 = time.perf_counter()
+                _, u, _ = self._mpc.solve(
+                    initial_pose=np.array([0.0, 0.0, 0.5 * np.pi]),
+                    waypoints=processed_wp,
+                    cost_weights=processed_cw,
+                )
+                mpc_solve_time += time.perf_counter() - t_mpc0
+
+                ctrl = _to_walker_control_mpc(
+                    u[0], self._get_pose(i), self.dt)
+                self.robots[i].apply_control(ctrl)
+
+            self.ped_mgr.update(self.dt, self._cached_obs_pos_ue)
+
+            t_tick0 = time.perf_counter()
+            self.world.tick()
+            sim_tick_time += time.perf_counter() - t_tick0
+
+            for i in range(N):
+                self._update_buffer(i)
+                if self._collect_substep_frames:
+                    self._substep_frames[i].append(
+                        self.rgb_buffers[i][-1].copy())
+
+        self._last_mpc_solve_time = mpc_solve_time
+        self._last_sim_tick_time = sim_tick_time
 
     # ── BEV capture ───────────────────────────────────────────────────
 
@@ -1444,6 +1711,34 @@ class CarlaMultiAgentEnv:
         u = s / 2.0 + scale * dx
         v = s / 2.0 - scale * dz
         return np.stack([u, v], axis=-1)
+
+    # ── Solvability statistics ─────────────────────────────────────────
+
+    def get_solvability_stats(self, reset=False):
+        """Return cumulative solvability statistics and optionally reset.
+
+        Returns a dict with:
+        - ``solvable_episodes``: count of episodes confirmed solvable
+        - ``unsolvable_episodes``: count that remained unsolvable after retries
+        - ``unsolvable_rate``: fraction unsolvable (0 if no episodes)
+        - ``goal_retries_total``: total goal-resampling retries
+        - ``mean_goal_retries``: mean retries per episode (0 if no episodes)
+        """
+        total = self._solvable_episodes + self._unsolvable_episodes
+        stats = {
+            'solvable_episodes': self._solvable_episodes,
+            'unsolvable_episodes': self._unsolvable_episodes,
+            'unsolvable_rate': (
+                self._unsolvable_episodes / total if total > 0 else 0.0),
+            'goal_retries_total': self._goal_retries_total,
+            'mean_goal_retries': (
+                self._goal_retries_total / total if total > 0 else 0.0),
+        }
+        if reset:
+            self._solvable_episodes = 0
+            self._unsolvable_episodes = 0
+            self._goal_retries_total = 0
+        return stats
 
     # ── Cleanup ───────────────────────────────────────────────────────
 

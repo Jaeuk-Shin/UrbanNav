@@ -44,6 +44,7 @@ from rl.utils.vis import (visualize, compute_bev_specs,
                           WeatherTracker, log_weather_distributions)
 from rl.utils.logger import log_metrics, EpisodeTracker, EpisodeTrajectoryAccumulator
 from rl.utils.buffer import RolloutBuffers, compute_gae
+from rl.utils.timer import StepTimer
 
 
 
@@ -303,6 +304,7 @@ def train(args):
         navmesh_cache_dir=args.navmesh_cache_dir,
         quadrant_margin=args.quadrant_margin,
         randomize_weather=args.weather,
+        use_mpc=args.use_mpc,
     )
 
     # num_envs = total rollout slots (servers × agents_per_server),
@@ -316,7 +318,7 @@ def train(args):
         f"sequential LSTM replay"
     )
     minibatch_size = batch_size // args.num_minibatches
-    action_dim = cfg.model.decoder.len_traj_pred * 2 if args.use_decoder else 2
+    action_dim = cfg.model.decoder.len_traj_pred * 2
 
     # ── action history ──
     n_action_history = args.n_action_history
@@ -427,10 +429,12 @@ def train(args):
     )
 
     t_start = time.time()
+    timer = StepTimer(cuda_sync=True)
 
     try:
         for iteration in range(1, args.num_iterations + 1):
             t0 = time.time()
+            timer.reset()
 
             # optional LR annealing
             if args.anneal_lr:
@@ -516,26 +520,29 @@ def train(args):
                         cord_t = torch.as_tensor(obs_dict["cord"], dtype=torch.float32, device=device)
 
                         # compute frozen encoder + decoder transformer once; cache on GPU
-                        if use_simple_encoder:
-                            features = agent.obs_encoder(obs_t[:, -1:])  # (num_envs, 1, 768)
-                        else:
-                            features = agent.obs_encoder(obs_t, cord_t)  # (num_envs, context_size+1, 768)
+                        with timer("encoder"):
+                            if use_simple_encoder:
+                                features = agent.obs_encoder(obs_t[:, -1:])  # (num_envs, 1, 768)
+                            else:
+                                features = agent.obs_encoder(obs_t, cord_t)  # (num_envs, context_size+1, 768)
                         bufs.features_gpu[step] = features
 
                         if args.use_decoder:
-                            tokens = agent.action_decoder.positional_encoding(features)
-                            dec_out = agent.action_decoder.sa_decoder(tokens).mean(dim=1)  # (num_envs, 768)
+                            with timer("decoder"):
+                                tokens = agent.action_decoder.positional_encoding(features)
+                                dec_out = agent.action_decoder.sa_decoder(tokens).mean(dim=1)  # (num_envs, 768)
                             bufs.dec_out_gpu[step] = dec_out
                         else:
                             dec_out = None
 
-                    action, logprob, _, value, lstm_state = (
-                        agent.get_action_and_value(
-                            obs_t, cord_t, goal_t, lstm_state,
-                            features=features, dec_out=dec_out,
-                            action_history=ah_t,
+                    with timer("policy"):
+                        action, logprob, _, value, lstm_state = (
+                            agent.get_action_and_value(
+                                obs_t, cord_t, goal_t, lstm_state,
+                                features=features, dec_out=dec_out,
+                                action_history=ah_t,
+                            )
                         )
-                    )
 
                 actions_np = action.cpu().numpy()
                 bufs.actions[step] = actions_np
@@ -548,20 +555,20 @@ def train(args):
                         action_hist[:, :-action_dim] = action_hist[:, action_dim:]
                     action_hist[:, -action_dim:] = actions_np
 
-                # When use_decoder is active the agent produces len_traj_pred×2
-                # waypoints, but the multi-agent env expects a single 2D delta.
-                # Send only the first waypoint to the env; the full action is
-                # kept in bufs.actions for PPO log-prob / entropy recomputation.
-                if args.use_decoder:
-                    env_actions = actions_np[:, :2]
-                else:
-                    env_actions = actions_np
-                # Clip actions to the env's valid range before stepping.
-                # The raw (unclipped) action + log_prob stay in the buffers
-                # so PPO's importance-sampling ratio remains correct.
-                env_actions = np.clip(env_actions, -args.max_speed, args.max_speed)
-                obs_dict, rewards, terminateds, truncateds, infos = vec_env.step(env_actions)
+                # The env now expects (num_envs, future_length * 2) waypoints.
+                env_actions = actions_np
+                with timer("env_step"):
+                    obs_dict, rewards, terminateds, truncateds, infos = vec_env.step(env_actions)
                 dones = np.logical_or(terminateds, truncateds).astype(np.float32)
+
+                # Aggregate env-side timing (MPC, sim tick) from info dicts
+                sim_ticks = [info.get('sim_tick_time', 0.0) for info in infos]
+                if sim_ticks:
+                    timer.record("sim_tick", np.mean(sim_ticks))
+                if args.use_mpc:
+                    mpc_times = [info.get('mpc_solve_time', 0.0) for info in infos]
+                    if mpc_times:
+                        timer.record("mpc_solve", np.mean(mpc_times))
 
                 weather_tracker.update(infos)
 
@@ -637,21 +644,22 @@ def train(args):
                         ep_accum.on_episode_end(i, obs_dict['cord'][i])
 
             # ── bootstrap value for end of rollout ──
-            with torch.no_grad():
-                goal_t = torch.as_tensor(obs_dict["goal"], dtype=torch.float32, device=device)
-                ah_t = None
-                if action_history_dim > 0:
-                    ah_t = torch.as_tensor(action_hist, dtype=torch.float32, device=device)
-                if use_goal_only:
-                    last_value = agent.get_value(
-                        None, None, goal_t, lstm_state, action_history=ah_t
-                    ).cpu().numpy()
-                else:
-                    obs_t = torch.as_tensor(obs_dict["obs"], device=device)
-                    cord_t = torch.as_tensor(obs_dict["cord"], dtype=torch.float32, device=device)
-                    last_value = agent.get_value(
-                        obs_t, cord_t, goal_t, lstm_state, action_history=ah_t
-                    ).cpu().numpy()
+            with timer("bootstrap"):
+                with torch.no_grad():
+                    goal_t = torch.as_tensor(obs_dict["goal"], dtype=torch.float32, device=device)
+                    ah_t = None
+                    if action_history_dim > 0:
+                        ah_t = torch.as_tensor(action_hist, dtype=torch.float32, device=device)
+                    if use_goal_only:
+                        last_value = agent.get_value(
+                            None, None, goal_t, lstm_state, action_history=ah_t
+                        ).cpu().numpy()
+                    else:
+                        obs_t = torch.as_tensor(obs_dict["obs"], device=device)
+                        cord_t = torch.as_tensor(obs_dict["cord"], dtype=torch.float32, device=device)
+                        last_value = agent.get_value(
+                            obs_t, cord_t, goal_t, lstm_state, action_history=ah_t
+                        ).cpu().numpy()
 
             # ── Build next_values array for GAE ──
             # Default: next_values[t] = values[t+1], last step = last_value.
@@ -665,11 +673,12 @@ def train(args):
             next_values[mask] = bufs.trunc_values[mask]
 
             # ── GAE ──
-            advantages, returns = compute_gae(
-                bufs.rewards, bufs.values, bufs.terminateds, bufs.dones,
-                next_values,
-                gamma=args.gamma, gae_lambda=args.gae_lambda,
-            )
+            with timer("gae"):
+                advantages, returns = compute_gae(
+                    bufs.rewards, bufs.values, bufs.terminateds, bufs.dones,
+                    next_values,
+                    gamma=args.gamma, gae_lambda=args.gae_lambda,
+                )
 
             # Reset truncation buffers for next rollout
             bufs.trunc_values[:] = 0
@@ -681,19 +690,36 @@ def train(args):
                 context_size, obs_feat_dim,
                 norm_adv=args.norm_adv,
             )
-            stats = ppo_update(agent, optimizer, batch, args,
-                               num_steps, num_envs,
-                               initial_lstm_state, device,
-                               use_goal_only=use_goal_only)
+            with timer("ppo_update"):
+                stats = ppo_update(agent, optimizer, batch, args,
+                                   num_steps, num_envs,
+                                   initial_lstm_state, device,
+                                   use_goal_only=use_goal_only)
 
             # ── logging / vis / checkpoint ──
             ep_stats = ep_tracker.flush()
+            # Merge env-level solvability stats into episode stats for
+            # unified logging (reset counters each flush cycle).
+            try:
+                solv_stats = vec_env.get_solvability_stats(reset=True)
+                if ep_stats is not None:
+                    ep_stats.update({
+                        'unsolvable_rate': solv_stats['unsolvable_rate'],
+                        'unsolvable_episodes': solv_stats['unsolvable_episodes'],
+                    })
+                elif solv_stats.get('unsolvable_episodes', 0) > 0:
+                    # No completed episodes this iteration, but we still
+                    # want to surface solvability warnings.
+                    ep_stats = solv_stats
+            except Exception:
+                pass  # env may not support solvability stats (e.g. PointNavEnv)
             should_log_wandb = (args.log_every > 0
                                 and iteration % args.log_every == 0)
             ep_reward = log_metrics(iteration, args.num_iterations, global_step,
                                     bufs, stats, optimizer, t_start, t0, wandb,
                                     ep_stats=ep_stats,
-                                    log_wandb=should_log_wandb)
+                                    log_wandb=should_log_wandb,
+                                    timer=timer)
 
             if is_vis_iter:
                 _enc = agent.obs_encoder if not use_goal_only else None
@@ -819,6 +845,9 @@ if __name__ == "__main__":
     parser.add_argument("--teleport", action="store_true", default=False,
                         help="Use direct set_transform control instead of WalkerControl "
                              "(eliminates physics lag between cmd/real velocity)")
+    parser.add_argument("--use_mpc", action="store_true", default=False,
+                        help="Enable MPC waypoint tracking (unicycle model). The MPC is "
+                             "JIT-compiled once at env creation and persists across resets.")
     
     parser.add_argument("--goal_range", type=float, default=40.0)
     parser.add_argument("--quadrant_margin", type=float, default=None,
@@ -875,7 +904,7 @@ if __name__ == "__main__":
     parser.add_argument("--gae_lambda", type=float, default=0.95)
     parser.add_argument("--clip_coef", type=float, default=0.2)
     parser.add_argument("--vf_coef", type=float, default=0.5)
-    parser.add_argument("--ent_coef", type=float, default=1e-4)
+    parser.add_argument("--ent_coef", type=float, default=1e-2)
     parser.add_argument("--max_grad_norm", type=float, default=0.2)
     parser.add_argument("--clip_vloss", action="store_true", default=True,
                         help="Clip value function loss (PPO-style)")

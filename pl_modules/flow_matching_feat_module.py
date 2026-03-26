@@ -142,12 +142,6 @@ class FlowMatchingFeatModule(pl.LightningModule):
     # Visualization
     # ------------------------------------------------------------------
 
-    def _has_camera_cfg(self):
-        """Check whether the config contains camera intrinsic parameters."""
-        d = self.cfg.data
-        return all(hasattr(d, k) for k in ('width', 'height', 'fov',
-                                            'desired_width', 'desired_height'))
-
     def process_visualization(self, mode, batch, wp_pred):
         if mode == 'val':
             num_visualize = self.val_num_visualize
@@ -163,7 +157,8 @@ class FlowMatchingFeatModule(pl.LightningModule):
         os.makedirs(vis_dir, exist_ok=True)
         batch_size = batch['obs_features'].size(0)
 
-        has_camera = self._has_camera_cfg()
+        # Per-sample camera intrinsics: (B, 5) tensor or None
+        cam_all = batch.get('camera_intrinsics')
 
         for idx in range(batch_size):
             if self.vis_count >= num_visualize:
@@ -182,6 +177,17 @@ class FlowMatchingFeatModule(pl.LightningModule):
                 and os.path.exists(batch['image_path'][idx])
             )
 
+            # Per-sample camera params (sentinel -1 means absent)
+            has_camera = (
+                cam_all is not None
+                and cam_all[idx, 0].item() > 0
+            )
+
+            if has_camera:
+                width, height, fov, dw, dh = cam_all[idx].tolist()
+            else:
+                fov = None
+
             if has_image and has_camera:
                 fig, (ax_img, ax_coord) = plt.subplots(1, 2, figsize=(12, 6))
                 plt.subplots_adjust(wspace=0.3)
@@ -189,6 +195,8 @@ class FlowMatchingFeatModule(pl.LightningModule):
                     ax_img, batch['image_path'][idx],
                     gt_waypoints, pred_waypoints,
                     batch['gt_waypoints_y'][idx].cpu().numpy(),
+                    width=width, height=height, fov=fov,
+                    desired_width=dw, desired_height=dh,
                 )
             else:
                 fig, ax_coord = plt.subplots(figsize=(6, 6))
@@ -196,7 +204,7 @@ class FlowMatchingFeatModule(pl.LightningModule):
             # -- Coordinate plot (always shown) --
             self._draw_coord_panel(
                 ax_coord, original_input_positions, noisy_input_positions,
-                gt_waypoints, pred_waypoints, show_fov=has_camera,
+                gt_waypoints, pred_waypoints, fov=fov,
             )
 
             plt.savefig(os.path.join(vis_dir, f'sample_{self.vis_count}.png'))
@@ -206,13 +214,14 @@ class FlowMatchingFeatModule(pl.LightningModule):
     # -- visualisation helpers --------------------------------------------------
 
     def _draw_image_panel(self, ax, image_path, gt_waypoints, pred_waypoints,
-                          gt_waypoints_y):
+                          gt_waypoints_y, *, width, height, fov,
+                          desired_width, desired_height):
         """Render the raw image with projected waypoint overlays."""
         img = Image.open(image_path).convert('RGB')
         W_orig, H_orig = img.size
 
-        dw = self.cfg.data.desired_width
-        dh = self.cfg.data.desired_height
+        dw = int(desired_width)
+        dh = int(desired_height)
 
         # Center-crop / pad to match training resolution
         if W_orig != dw or H_orig != dh:
@@ -224,10 +233,7 @@ class FlowMatchingFeatModule(pl.LightningModule):
         ax.axis('off')
 
         # Camera intrinsics & crop offset
-        width = self.cfg.data.width
-        height = self.cfg.data.height
-        fov = self.cfg.data.fov
-        K = build_intrinsic_matrix(w=width, h=height, fov=fov)
+        K = build_intrinsic_matrix(w=int(width), h=int(height), fov=fov)
 
         x_offset = 0.5 * (width - dw)
         y_offset = 0.5 * (height - dh)
@@ -261,10 +267,9 @@ class FlowMatchingFeatModule(pl.LightningModule):
         ax.set_ylim(dh, 0.0)
 
     def _draw_coord_panel(self, ax, original_input, noisy_input, gt_waypoints,
-                          pred_waypoints, *, show_fov=False):
+                          pred_waypoints, *, fov=None):
         """Render the 2-D coordinate trajectory plot."""
-        if show_fov:
-            fov = self.cfg.data.fov
+        if fov is not None:
             th = np.pi / 2.0 - np.deg2rad(fov) / 2.0
             r = np.linspace(0.0, 7.0, num=100)
             c, s = np.cos(th), np.sin(th)

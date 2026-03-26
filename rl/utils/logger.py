@@ -6,7 +6,7 @@ import numpy as np
 # ─── Logging ─────────────────────────────────────────────────────────
 def log_metrics(iteration, num_iterations, global_step, bufs, stats,
                 optimizer, t_start, t0, wandb_module, ep_stats=None,
-                log_wandb=True):
+                log_wandb=True, timer=None):
     """Print console summary and log to W&B. Returns mean episode reward."""
     iter_time = time.time() - t0
     total_time = time.time() - t_start
@@ -52,6 +52,14 @@ def log_metrics(iteration, num_iterations, global_step, bufs, stats,
                 f"ped={ep_stats['mean_pedestrian_collisions']:.1f}/ep "
                 f"({ep_stats['pedestrian_collision_rate']:.0%})"
             )
+        solv_str = ""
+        if ep_stats.get('unsolvable_rate', 0) > 0:
+            solv_str = (
+                f"\n  solvability: "
+                f"unsolvable={ep_stats.get('unsolvable_episodes', 0)}  "
+                f"rate={ep_stats['unsolvable_rate']:.1%}  "
+                f"retries={ep_stats.get('mean_goal_retries', 0):.2f}/ep"
+            )
         print(
             f"  episodes: n={ep_stats['num_episodes']}  "
             f"success={ep_stats['success_rate']:.2f}  "
@@ -60,7 +68,14 @@ def log_metrics(iteration, num_iterations, global_step, bufs, stats,
             f"ep_len={ep_stats['mean_episode_length']:.1f}  "
             f"final_dist={ep_stats['mean_final_distance']:.2f}"
             f"{col_str}"
+            f"{solv_str}"
         )
+
+    # Print timing summary to console
+    if timer is not None:
+        timing_line = timer.summary_str()
+        if timing_line:
+            print(timing_line)
 
     if wandb_module is not None and log_wandb:
         log_dict = {
@@ -88,6 +103,9 @@ def log_metrics(iteration, num_iterations, global_step, bufs, stats,
         if ep_stats is not None:
             for k, v in ep_stats.items():
                 log_dict[f"episode/{k}"] = v
+        # Per-component timing stats
+        if timer is not None:
+            log_dict.update(timer.wandb_dict())
         wandb_module.log(log_dict, step=global_step)
 
     return ep_reward
@@ -121,8 +139,11 @@ class EpisodeTracker:
                     'length': int(self._ep_length[i]),
                     'is_success': bool(infos[i].get('is_success', False)),
                     'initial_distance': float(infos[i].get('initial_distance', 0.0)),
+                    'initial_geodesic_distance': float(
+                        infos[i].get('initial_geodesic_distance', 0.0)),
                     'path_length': float(infos[i].get('path_length', 0.0)),
                     'final_distance': float(infos[i].get('distance_to_goal', 0.0)),
+                    'goal_retries': int(infos[i].get('goal_retries', 0)),
                     'obstacle_collisions': int(self._ep_obs_collisions[i]),
                     'pedestrian_collisions': int(self._ep_ped_collisions[i]),
                 })
@@ -139,9 +160,12 @@ class EpisodeTracker:
         success_rate = np.mean([e['is_success'] for e in self._completed])
 
         # SPL: (1/N) * Σ S_i * L_i / max(P_i, L_i)
+        # Uses geodesic initial distance (L_i) when available, falling
+        # back to Euclidean.
         spl_terms = []
         for e in self._completed:
-            li = e['initial_distance']
+            geo_li = e.get('initial_geodesic_distance', 0.0)
+            li = geo_li if geo_li > 0 else e['initial_distance']
             pi = e['path_length']
             si = float(e['is_success'])
             denom = max(pi, li)
@@ -150,6 +174,10 @@ class EpisodeTracker:
 
         obs_cols = [e['obstacle_collisions'] for e in self._completed]
         ped_cols = [e['pedestrian_collisions'] for e in self._completed]
+        retries = [e.get('goal_retries', 0) for e in self._completed]
+
+        geo_dists = [e.get('initial_geodesic_distance', 0.0)
+                     for e in self._completed]
 
         stats = {
             'success_rate': float(success_rate),
@@ -157,6 +185,8 @@ class EpisodeTracker:
             'mean_episode_return': float(np.mean([e['return'] for e in self._completed])),
             'mean_episode_length': float(np.mean([e['length'] for e in self._completed])),
             'mean_final_distance': float(np.mean([e['final_distance'] for e in self._completed])),
+            'mean_initial_geodesic_distance': float(np.mean(geo_dists)),
+            'mean_goal_retries': float(np.mean(retries)),
             'num_episodes': n,
             'obstacle_collision_rate': float(np.mean([c > 0 for c in obs_cols])),
             'pedestrian_collision_rate': float(np.mean([c > 0 for c in ped_cols])),
