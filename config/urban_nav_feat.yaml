@@ -61,30 +61,35 @@ data:
   input_noise: 0.1
   horizontal_flip_prob: 0.5
   mixture:
-    - root: '/path/to/dataset_a'
-      weight: 0.5
+    - root: '/home3/rvl/dataset/carla'
+      weight: 0.3
+      camera:
+        width: 640
+        height: 480
+        fov: 110.0
+        desired_width: 640
+        desired_height: 360
       # num_train: 1000    # per-dataset override (falls back to top-level)
       # num_val: 25
       # pose_subdir: pose  # default
       # feature_subdir: dino  # default
       # camera:             # per-dataset camera intrinsics (optional)
-      #   --- FOV-based (CARLA-style) ---
       #   width: 640
       #   height: 480
       #   fov: 110.0
       #   desired_width: 640
       #   desired_height: 360
-      #   --- OR explicit intrinsics ---
-      #   fx: 410
-      #   fy: 410
-      #   cx: 320
-      #   cy: 180
-      #   desired_width: 640
-      #   desired_height: 360
-    - root: '/path/to/dataset_b'
-      weight: 0.3
-    - root: '/path/to/dataset_c'
-      weight: 0.2
+    - root: '/home3/rvl/dataset/youtube_videos'
+      weight: 0.7
+      camera:
+        fx: 410
+        fy: 410
+        cx: 320
+        cy: 180
+        desired_width: 640
+        desired_height: 360
+
+
 
 validation:
   num_visualize: 400

@@ -477,6 +477,8 @@ def train(args):
                     print(f"  [BEV] capture failed: {e}")
             # per-env list of substep frame lists (only populated on vis iterations)
             substep_frames = [[] for _ in range(num_envs)] if is_vis_iter else None
+            # per-env MPC/policy vis data (only on vis iterations)
+            mpc_vis_data = [[] for _ in range(num_envs)] if is_vis_iter else None
 
             # ── rollout collection ──
             agent.eval()
@@ -578,6 +580,21 @@ def train(args):
                         sf = infos[i].get('substep_frames')
                         if sf is not None:
                             substep_frames[i].append(sf)
+
+                # collect MPC/policy vis data on vis iterations
+                if mpc_vis_data is not None:
+                    for i in range(num_envs):
+                        entry = {}
+                        wp = infos[i].get('policy_waypoints_cam')
+                        if wp is not None:
+                            entry['policy_waypoints_cam'] = wp
+                        x_sol = infos[i].get('mpc_x_sol')
+                        u_sol = infos[i].get('mpc_u_sol')
+                        if x_sol is not None:
+                            entry['mpc_x_sol'] = x_sol
+                            entry['mpc_u_sol'] = u_sol
+                        if entry:
+                            mpc_vis_data[i].append(entry)
 
                 # episode tracking (before reward clipping/normalization)
                 ep_tracker.step(rewards, dones, infos)
@@ -725,7 +742,8 @@ def train(args):
                 _enc = agent.obs_encoder if not use_goal_only else None
                 visualize(iteration, args, bufs, bev_images, bev_metas, wandb,
                           substep_frames=substep_frames, obs_encoder=_enc,
-                          obstacle_layouts=obstacle_layouts)
+                          obstacle_layouts=obstacle_layouts,
+                          mpc_vis_data=mpc_vis_data)
                 vec_env.set_collect_substep_frames(False)
 
                 # ── complete-episode BEV (retroactive capture at spawn positions)

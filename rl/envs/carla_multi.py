@@ -1302,6 +1302,15 @@ class CarlaMultiAgentEnv:
                 info['mpc_solve_time'] = self._last_mpc_solve_time
             if self._collect_substep_frames and self._substep_frames[i]:
                 info['substep_frames'] = np.stack(self._substep_frames[i])
+            # MPC & policy vis data (only on vis iterations to avoid overhead)
+            if self._collect_substep_frames:
+                info['policy_waypoints_cam'] = per_agent_waypoints[i].copy()
+                if (self.use_mpc
+                        and hasattr(self, '_last_mpc_solutions')
+                        and self._last_mpc_solutions[i] is not None):
+                    x_sol, u_sol = self._last_mpc_solutions[i]
+                    info['mpc_x_sol'] = x_sol    # (horizon+1, 3)
+                    info['mpc_u_sol'] = u_sol    # (horizon, 2)
             infos.append(info)
 
             if terminated or truncated:
@@ -1501,6 +1510,8 @@ class CarlaMultiAgentEnv:
         # Phase 2: sub-steps with MPC
         mpc_solve_time = 0.0
         sim_tick_time = 0.0
+        # Capture the first sub-step's MPC solution per agent for vis
+        self._last_mpc_solutions = [None] * N
         for t in range(self.n_skips):
             for i in range(N):
                 # Re-project world waypoints into the current camera frame
@@ -1524,15 +1535,21 @@ class CarlaMultiAgentEnv:
                     repeats=self.n_skips, shifts=t), axis=-1)
 
                 t_mpc0 = time.perf_counter()
-                _, u, _ = self._mpc.solve(
+                x_sol, u_sol, _ = self._mpc.solve(
                     initial_pose=np.array([0.0, 0.0, 0.5 * np.pi]),
                     waypoints=processed_wp,
                     cost_weights=processed_cw,
                 )
                 mpc_solve_time += time.perf_counter() - t_mpc0
 
+                # Store first sub-step solution (full open-loop plan from
+                # the moment the policy output was received)
+                if t == 0:
+                    self._last_mpc_solutions[i] = (
+                        x_sol.copy(), u_sol.copy())
+
                 ctrl = _to_walker_control_mpc(
-                    u[0], self._get_pose(i), self.dt)
+                    u_sol[0], self._get_pose(i), self.dt)
                 self.robots[i].apply_control(ctrl)
 
             self.ped_mgr.update(self.dt, self._cached_obs_pos_ue)

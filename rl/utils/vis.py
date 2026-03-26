@@ -9,7 +9,8 @@ from matplotlib.collections import LineCollection
 
 # ─── Visualisation ───────────────────────────────────────────────────
 def visualize(iteration, args, bufs, bev_images, bev_metas, wandb_module,
-              substep_frames=None, obs_encoder=None, obstacle_layouts=None):
+              substep_frames=None, obs_encoder=None, obstacle_layouts=None,
+              mpc_vis_data=None):
     """Log BEV trajectory, control, and ego-video figures."""
     vis_dir = os.path.join(args.save_dir, "vis")
     wrun = wandb_module
@@ -50,6 +51,7 @@ def visualize(iteration, args, bufs, bev_images, bev_metas, wandb_module,
         wandb=wrun,
         substep_frames=substep_frames,
         grid_cols=args.num_agents_per_server,
+        mpc_vis_data=mpc_vis_data,
     )
 
     if obs_encoder is not None:
@@ -61,6 +63,18 @@ def visualize(iteration, args, bufs, bev_images, bev_metas, wandb_module,
             wandb=wrun,
             grid_cols=args.num_agents_per_server,
             substep_frames=substep_frames,
+        )
+
+    # MPC/policy dashboard (speed, velocity commands, wall times)
+    if mpc_vis_data is not None and any(len(d) > 0 for d in mpc_vis_data):
+        log_mpc_dashboard(
+            bufs.cmd_speed, bufs.real_speed,
+            bufs.dones,
+            mpc_vis_data=mpc_vis_data,
+            grid_cols=args.num_agents_per_server,
+            iteration=iteration,
+            save_dir=vis_dir,
+            wandb=wrun,
         )
 
 
@@ -1153,7 +1167,7 @@ def log_complete_episode_bev(
 
 
 def _annotate_ego_frames(frames, rewards=None, dones=None, goals=None,
-                         terminateds=None):
+                         terminateds=None, mpc_vis_data=None, n_skips=None):
     """
     Add per-step overlays to a sequence of RGB frames.
 
@@ -1166,6 +1180,8 @@ def _annotate_ego_frames(frames, rewards=None, dones=None, goals=None,
     * Top-right minimap: ego-centric bird's-eye square showing the agent
       (centre, facing up) and goal position with distance rings.
     * Goal projection onto the ego view (pinhole model).
+    * Policy waypoints projected onto image (green dots+line).
+    * MPC trajectory projected onto image (cyan line), when available.
 
     Parameters
     ----------
@@ -1174,6 +1190,12 @@ def _annotate_ego_frames(frames, rewards=None, dones=None, goals=None,
     dones       : (T,) float  or None  - 1.0 at any episode boundary
     goals       : (T, 2) float or None - (goal_x_std, goal_z_std), relative
     terminateds : (T,) float  or None  - 1.0 only at true terminations (success)
+    mpc_vis_data : list[dict] or None  - per *policy-step* MPC/policy data;
+        each dict may contain 'policy_waypoints_cam' (F,2),
+        'mpc_x_sol' (H+1,3), 'mpc_u_sol' (H,2).
+    n_skips     : int or None  - substep expansion factor.  When substep
+        frames are used, T = num_policy_steps * n_skips; MPC data is drawn
+        only on the first substep of each policy step.
 
     Returns : (T, H, W, 3) uint8
     """
@@ -1367,9 +1389,164 @@ def _annotate_ego_frames(frames, rewards=None, dones=None, goals=None,
             draw.text((tx + 1, ty + 1), dist_label, fill=(0, 0, 0))
             draw.text((tx, ty), dist_label, fill=(255, 200, 50))
 
+        # ── MPC/policy waypoint overlay ──────────────────────────────
+        # Draw on the first substep of each policy step (or every frame
+        # when n_skips is None / 1).
+        if mpc_vis_data is not None:
+            _nskip = n_skips if n_skips is not None else 1
+            policy_step = t // _nskip
+            is_first_substep = (t % _nskip == 0)
+            if is_first_substep and policy_step < len(mpc_vis_data):
+                _mpc_entry = mpc_vis_data[policy_step]
+                draw = ImageDraw.Draw(img)
+
+                # Pinhole projection: camera-frame (x_cam, y_cam, z_cam) → image
+                # Camera: 640×480, 110° horizontal FOV (stack_omr4.json)
+                _fov_h = math.radians(110.0)
+                _fx = W / (2.0 * math.tan(_fov_h / 2.0))
+                _cam_h = 0.73  # camera height above ground
+
+                def _project_cam_xz(xz_arr):
+                    """Project (N, 2) camera-frame xz waypoints to image pixels.
+                    Returns (N, 2) array of (u, v) and (N,) bool validity mask."""
+                    pts = np.asarray(xz_arr)
+                    x_c, z_c = pts[:, 0], pts[:, 1]
+                    valid = z_c > 0.1
+                    u = np.where(valid, _fx * x_c / z_c + W / 2.0, 0.0)
+                    v = np.where(valid, _fx * _cam_h / z_c + H / 2.0, 0.0)
+                    return np.stack([u, v], axis=-1), valid
+
+                # Policy waypoints (green)
+                wp = _mpc_entry.get('policy_waypoints_cam')
+                if wp is not None and len(wp) >= 2:
+                    uv, valid = _project_cam_xz(wp)
+                    pts_uv = [(float(uv[j, 0]), float(uv[j, 1]))
+                              for j in range(len(uv)) if valid[j]]
+                    if len(pts_uv) >= 2:
+                        draw.line(pts_uv, fill=(50, 220, 50, 200), width=2)
+                    for pu, pv in pts_uv:
+                        r = 3
+                        draw.ellipse([pu - r, pv - r, pu + r, pv + r],
+                                     fill=(50, 220, 50), outline=(255, 255, 255))
+
+                # MPC open-loop trajectory (cyan)
+                x_sol = _mpc_entry.get('mpc_x_sol')
+                if x_sol is not None and len(x_sol) >= 2:
+                    # MPC state: (x_mpc, y_mpc, theta) where x=right, y=forward
+                    mpc_xz = x_sol[:, [0, 1]]  # (x_cam, z_cam)
+                    uv, valid = _project_cam_xz(mpc_xz)
+                    pts_uv = [(float(uv[j, 0]), float(uv[j, 1]))
+                              for j in range(len(uv)) if valid[j]]
+                    if len(pts_uv) >= 2:
+                        draw.line(pts_uv, fill=(0, 230, 255, 200), width=2)
+
         out.append(np.array(img, dtype=np.uint8))
 
     return np.array(out, dtype=np.uint8)
+
+
+def log_mpc_dashboard(
+    buf_cmd_speed, buf_real_speed, buf_dones,
+    mpc_vis_data=None,
+    grid_cols=None,
+    iteration=0,
+    save_dir=None,
+    wandb=None,
+):
+    """
+    Render a per-env MPC/policy dashboard with time-series panels.
+
+    Panels per env (one column per env):
+      Row 0: Speed — commanded vs real
+      Row 1: MPC velocity commands — linear (v) and angular (omega)
+
+    Parameters
+    ----------
+    buf_cmd_speed  : (num_steps, num_envs) float
+    buf_real_speed : (num_steps, num_envs) float
+    buf_dones      : (num_steps, num_envs) float
+    mpc_vis_data   : list[list[dict]] or None — per-env, per-step MPC data
+    """
+    import matplotlib.pyplot as plt
+
+    num_steps, num_envs = buf_cmd_speed.shape
+    if grid_cols is None:
+        grid_cols = math.ceil(math.sqrt(num_envs))
+    grid_rows = math.ceil(num_envs / grid_cols)
+
+    n_panel_rows = 2  # speed, velocity commands
+    fig, axes = plt.subplots(
+        n_panel_rows * grid_rows, grid_cols,
+        figsize=(4.5 * grid_cols, 2.5 * n_panel_rows * grid_rows),
+        squeeze=False,
+    )
+    fig.subplots_adjust(hspace=0.45, wspace=0.3)
+
+    for env_idx in range(num_envs):
+        grid_r, grid_c = divmod(env_idx, grid_cols)
+        base_row = grid_r * n_panel_rows
+        steps = np.arange(num_steps)
+
+        # ── Row 0: Speed ──
+        ax_speed = axes[base_row][grid_c]
+        ax_speed.plot(steps, buf_cmd_speed[:, env_idx],
+                      label='cmd', color='tab:blue', linewidth=0.8, alpha=0.7)
+        ax_speed.plot(steps, buf_real_speed[:, env_idx],
+                      label='real', color='tab:blue', linewidth=1.2)
+        # Mark episode boundaries
+        ep_bounds = np.where(buf_dones[:-1, env_idx] > 0)[0]
+        for eb in ep_bounds:
+            ax_speed.axvline(eb, color='gray', linewidth=0.5, alpha=0.4)
+        ax_speed.set_ylabel('m/s', fontsize=8)
+        ax_speed.set_title(f'env {env_idx} — speed', fontsize=9)
+        ax_speed.legend(fontsize=7, ncol=2, loc='upper right')
+        ax_speed.tick_params(labelsize=7)
+        ax_speed.grid(True, alpha=0.3)
+
+        # ── Row 1: MPC velocity commands (v, omega) ──
+        ax_vel = axes[base_row + 1][grid_c]
+        if (mpc_vis_data is not None
+                and env_idx < len(mpc_vis_data)
+                and len(mpc_vis_data[env_idx]) > 0):
+            lin_vs, ang_vs = [], []
+            for entry in mpc_vis_data[env_idx]:
+                u_sol = entry.get('mpc_u_sol')
+                if u_sol is not None and len(u_sol) > 0:
+                    lin_vs.append(float(u_sol[0, 0]))
+                    ang_vs.append(float(u_sol[0, 1]))
+                else:
+                    lin_vs.append(0.0)
+                    ang_vs.append(0.0)
+            t_mpc = np.arange(len(lin_vs))
+            ax_vel.plot(t_mpc, lin_vs, label='v (m/s)',
+                        color='tab:purple', linewidth=1.0)
+            ax_vel.plot(t_mpc, ang_vs, label='\u03c9 (rad/s)',
+                        color='tab:brown', linewidth=1.0)
+            for eb in ep_bounds:
+                ax_vel.axvline(eb, color='gray', linewidth=0.5, alpha=0.4)
+        ax_vel.set_ylabel('cmd', fontsize=8)
+        ax_vel.set_title(f'env {env_idx} — MPC velocity', fontsize=9)
+        ax_vel.legend(fontsize=7, ncol=2, loc='upper right')
+        ax_vel.tick_params(labelsize=7)
+        ax_vel.grid(True, alpha=0.3)
+        ax_vel.set_xlabel('step', fontsize=8)
+
+    # Hide unused axes
+    for idx in range(num_envs, grid_rows * grid_cols):
+        r, c = divmod(idx, grid_cols)
+        for pr in range(n_panel_rows):
+            axes[r * n_panel_rows + pr][c].set_visible(False)
+
+    if save_dir is not None:
+        os.makedirs(save_dir, exist_ok=True)
+        path = os.path.join(save_dir, f"mpc_dashboard_{iteration:04d}.png")
+        fig.savefig(path, dpi=120, bbox_inches='tight')
+        print(f"  → MPC dashboard saved to {path}")
+
+    if wandb is not None:
+        wandb.log({"rollout/mpc_dashboard": wandb.Image(fig)})
+
+    plt.close(fig)
 
 
 def _minimap_ring_distances(map_radius):
@@ -1419,6 +1596,7 @@ def log_ego_video_grid(
     wandb=None,
     substep_frames=None,
     grid_cols=None,
+    mpc_vis_data=None,
 ):
     """
     Log a single grid video tiling all parallel environments.
@@ -1489,14 +1667,29 @@ def log_ego_video_grid(
                     buf_goal[:, env_idx], n_skips, axis=0
                 )
 
+            # Expand MPC vis data to substep frame count
+            _mpc_env = None
+            if (mpc_vis_data is not None
+                    and env_idx < len(mpc_vis_data)
+                    and len(mpc_vis_data[env_idx]) == num_steps):
+                _mpc_env = mpc_vis_data[env_idx]
+
             frames = _annotate_ego_frames(
                 all_frames,
                 rewards=expanded_rewards,
                 dones=expanded_dones,
                 goals=expanded_goals,
                 terminateds=expanded_terminateds,
+                mpc_vis_data=_mpc_env,
+                n_skips=n_skips,
             )
         else:
+            _mpc_env = None
+            if (mpc_vis_data is not None
+                    and env_idx < len(mpc_vis_data)
+                    and len(mpc_vis_data[env_idx]) == num_steps):
+                _mpc_env = mpc_vis_data[env_idx]
+
             raw = buf_obs[:, env_idx, -1]
             frames = _annotate_ego_frames(
                 raw,
@@ -1504,6 +1697,7 @@ def log_ego_video_grid(
                 dones=buf_dones[:, env_idx]   if buf_dones   is not None else None,
                 goals=buf_goal[:, env_idx]    if buf_goal    is not None else None,
                 terminateds=buf_terminateds[:, env_idx] if buf_terminateds is not None else None,
+                mpc_vis_data=_mpc_env,
             )
 
         env_frames.append(frames)
