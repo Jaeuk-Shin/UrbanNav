@@ -1,0 +1,162 @@
+{
+    "type": "vehicle.yandex.yandex",
+    "id": "ego",
+    "sensors": [
+        {
+            "type": "sensor.camera.rgb",
+            "id": "tldcam",
+            "spawn_point": {
+                "x": 0.32,
+                "y": -0.105,
+                "z": 0.73,
+                "roll": 0.0,
+                "pitch": 10.0,
+                "yaw": 0.0
+            },
+            "attributes": {
+                "image_size_x": 640.0,
+                "image_size_y": 480.0,
+                "fov": 55.0
+            }
+        },
+        {
+            "type": "sensor.camera.rgb",
+            "id": "fcam",
+            "spawn_point": {
+                "x": 0.32,
+                "y": 0.0,
+                "z": 0.73,
+                "roll": 0.0,
+                "pitch": 0.0,
+                "yaw": 0.0
+            },
+            "attributes": {
+                "image_size_x": 640.0,
+                "image_size_y": 480.0,
+                "fov": 110.0
+            }
+        },
+        {
+            "type": "sensor.camera.depth",
+            "id": "fcam_depth",
+            "spawn_point": {
+                "x": 0.32,
+                "y": 0.0,
+                "z": 0.73,
+                "roll": 0.0,
+                "pitch": 0.0,
+                "yaw": 0.0
+            },
+            "attributes": {
+                "image_size_x": 640.0,
+                "image_size_y": 480.0,
+                "fov": 110.0
+            }
+        },
+        {
+            "type": "sensor.camera.rgb",
+            "id": "flcam",
+            "spawn_point": {
+                "x": 0.32,
+                "y": -0.13,
+                "z": 0.73,
+                "roll": 0.0,
+                "pitch": -0.0,
+                "yaw": -30.00001951423156
+            },
+            "attributes": {
+                "image_size_x": 640.0,
+                "image_size_y": 480.0,
+                "fov": 110.0
+            }
+        },
+        {
+            "type": "sensor.camera.rgb",
+            "id": "frcam",
+            "spawn_point": {
+                "x": 0.321179,
+                "y": 0.146386,
+                "z": 0.729245,
+                "roll": -0.5959561014464119,
+                "pitch": 0.4187404864186944,
+                "yaw": 29.757040885870207
+            },
+            "attributes": {
+                "image_size_x": 640.0,
+                "image_size_y": 480.0,
+                "fov": 110.0
+            }
+        },
+        {
+            "type": "sensor.camera.rgb",
+            "id": "rcam",
+            "spawn_point": {
+                "x": 0.00763965,
+                "y": 0.272723,
+                "z": 0.567234,
+                "roll": -0.05966890489884938,
+                "pitch": -30.56696161214566,
+                "yaw": 89.48896395458299
+            },
+            "attributes": {
+                "image_size_x": 640.0,
+                "image_size_y": 480.0,
+                "fov": 110.0
+            }
+        },
+        {
+            "type": "sensor.camera.rgb",
+            "id": "bcam",
+            "spawn_point": {
+                "x": -0.337865,
+                "y": 0.0127916,
+                "z": 0.717606,
+                "roll": 0.23869982890363584,
+                "pitch": -25.479872528742682,
+                "yaw": 179.38072177585948
+            },
+            "attributes": {
+                "image_size_x": 640.0,
+                "image_size_y": 480.0,
+                "fov": 110.0
+            }
+        },
+        {
+            "type": "sensor.camera.rgb",
+            "id": "lcam",
+            "spawn_point": {
+                "x": 0.00339552,
+                "y": -0.253934,
+                "z": 0.570632,
+                "roll": 0.8297570099948348,
+                "pitch": -29.24803574493578,
+                "yaw": -90.37254032135672
+            },
+            "attributes": {
+                "image_size_x": 640.0,
+                "image_size_y": 480.0,
+                "fov": 110.0
+            }
+        },
+        {
+            "type": "sensor.lidar.ray_cast",
+            "id": "livox_lidar",
+            "spawn_point": {
+                "x": 0.30681,
+                "y": -0.0,
+                "z": 0.80926,
+                "roll": 0.0,
+                "pitch": -6.500022164054843,
+                "yaw": 0.0
+            },
+            "attributes": {
+                "range": 70,
+                "channels": 40,
+                "points_per_second": 600000,
+                "rotation_frequency": 20,
+                "upper_fov": 50,
+                "lower_fov": -10
+            }
+        }
+    ]
+}

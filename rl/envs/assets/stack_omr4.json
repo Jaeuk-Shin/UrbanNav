@@ -1,0 +1,23 @@
+{
+    "type": "walker",
+    "id": "ego_log",
+    "sensors": [
+        {
+            "type": "sensor.camera.rgb",
+            "id": "fcam",
+            "spawn_point": {
+                "x": 0.32,
+                "y": 0.0,
+                "z": 0.73,
+                "roll": 0.0,
+                "pitch": 0.0,
+                "yaw": 0.0
+            },
+            "attributes": {
+                "image_size_x": 640.0,
+                "image_size_y": 480.0,
+                "fov": 110.0
+            }
+        }
+    ]
+}

@@ -1,0 +1,2052 @@
+import numpy as np
+import math
+import os
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from matplotlib.collections import LineCollection
+
+
+# ─── Visualisation ───────────────────────────────────────────────────
+def visualize(iteration, args, bufs, bev_images, bev_metas, wandb_module,
+              substep_frames=None, obs_encoder=None, obstacle_layouts=None):
+    """Log BEV trajectory, control, and ego-video figures."""
+    vis_dir = os.path.join(args.save_dir, "vis")
+    wrun = wandb_module
+
+    log_bev_figure(
+        bufs.cord, bufs.goal_world, bufs.raw_rewards, bufs.dones,
+        buf_actions=bufs.actions,
+        bev_images=bev_images,
+        bev_metas=bev_metas,
+        obstacle_layouts=obstacle_layouts,
+        grid_cols=args.num_agents_per_server,
+        iteration=iteration,
+        save_dir=vis_dir,
+        wandb=wrun,
+    )
+    '''
+    log_ego_video(
+        bufs.obs,
+        buf_rewards=bufs.raw_rewards,
+        buf_dones=bufs.dones,
+        buf_goal=bufs.goal,
+        fps=args.vis_video_fps,
+        iteration=iteration,
+        save_dir=vis_dir,
+        wandb=wrun,
+        substep_frames=substep_frames,
+    )
+    '''
+    log_ego_video_grid(
+        bufs.obs,
+        buf_rewards=bufs.raw_rewards,
+        buf_dones=bufs.dones,
+        buf_goal=bufs.goal,
+        buf_terminateds=bufs.terminateds,
+        fps=args.vis_video_fps,
+        iteration=iteration,
+        save_dir=vis_dir,
+        wandb=wrun,
+        substep_frames=substep_frames,
+        grid_cols=args.num_agents_per_server,
+    )
+
+    if obs_encoder is not None:
+        log_dino_pca_video_grid(
+            obs_encoder, bufs.obs,
+            fps=args.vis_video_fps,
+            iteration=iteration,
+            save_dir=vis_dir,
+            wandb=wrun,
+            grid_cols=args.num_agents_per_server,
+            substep_frames=substep_frames,
+        )
+
+
+# ─── BEV Trajectory Visualization ────────────────────────────────────
+
+
+def _bev_world_to_pixel(xz_world, meta):
+    """
+    Project standard-coord (x, z) positions into BEV image pixel coordinates.
+
+    Parameters
+    ----------
+    xz_world : (..., 2)   - (x_std, z_std)
+    meta     : dict       - from CarlaEnv.capture_bev()
+
+    Returns  : (..., 2) float  - (u, v), u rightward, v downward
+    """
+    xz = np.asarray(xz_world, dtype=np.float64)
+    h, s = meta['altitude'], meta['img_size']
+    ctr  = meta['center_xz']
+    fov_rad = np.deg2rad(meta['fov_deg'])
+    scale = s / (2.0 * h * np.tan(fov_rad / 2.0))   # px / m
+    dx = xz[..., 0] - ctr[0]   # standard-x (right  → +u)
+    dz = xz[..., 1] - ctr[1]   # standard-z (forward → −v)
+    u = s / 2.0 + scale * dx
+    v = s / 2.0 - scale * dz
+    return np.stack([u, v], axis=-1)
+
+
+def compute_bev_specs(obs_cord, obs_goal_world,
+                      obstacle_layouts=None,
+                      fov=90.0, min_altitude=15.0, margin=5.0):
+    """Compute per-env BEV capture specs encompassing start, goal, and geodesic.
+
+    The returned altitude is chosen so that the camera's field of view
+    covers the bounding box of the agent position, goal position, and
+    (when available) the geodesic path connecting them, plus *margin*
+    metres of padding on each side.
+
+    Parameters
+    ----------
+    obs_cord : (E, context_size*2)
+        Flattened position history; ``[..., -2:]`` gives current (x, z).
+    obs_goal_world : (E, 2)
+        Goal position relative to the agent in world frame.
+    obstacle_layouts : list[dict] or None
+        Per-env layouts from ``get_obstacle_layouts()``.  When provided,
+        each agent's ``geodesic_path_std`` is included in the bounding box.
+    fov : float
+        Camera horizontal FOV in degrees.
+    min_altitude : float
+        Minimum BEV altitude in metres.
+    margin : float
+        Padding around the bounding box in metres.
+
+    Returns
+    -------
+    list of dict with keys ``env_idx``, ``center_xz``, ``altitude``
+    """
+    num_envs = len(obs_cord)
+    current_xz = obs_cord[:, -2:]                 # (E, 2)
+    goal_global = current_xz + obs_goal_world     # (E, 2)
+    fov_rad = np.deg2rad(fov)
+
+    specs = []
+    for env_idx in range(num_envs):
+        pts = [current_xz[env_idx].reshape(1, 2),
+               goal_global[env_idx].reshape(1, 2)]
+
+        # Include geodesic path when available
+        if obstacle_layouts is not None and env_idx < len(obstacle_layouts):
+            layout = obstacle_layouts[env_idx]
+            agents = layout.get('agents', []) if layout else []
+            aidx = env_idx % len(agents) if agents else -1
+            ag = agents[aidx] if 0 <= aidx < len(agents) else None
+            if ag is not None:
+                geo = ag.get('geodesic_path_std')
+                if geo is not None and len(geo) >= 2:
+                    pts.append(np.asarray(geo))
+
+        all_pts = np.vstack(pts)
+        valid = np.isfinite(all_pts).all(axis=1)
+        if not valid.any():
+            specs.append({
+                'env_idx': env_idx,
+                'center_xz': current_xz[env_idx].astype(np.float32),
+                'altitude': float(min_altitude),
+            })
+            continue
+
+        all_pts = all_pts[valid]
+        bb_min = np.min(all_pts, axis=0)
+        bb_max = np.max(all_pts, axis=0)
+        center = (bb_min + bb_max) / 2.0
+        half_ext = np.max((bb_max - bb_min) / 2.0) + margin
+
+        altitude = half_ext / np.tan(fov_rad / 2.0)
+        altitude = max(altitude, min_altitude)
+
+        specs.append({
+            'env_idx': env_idx,
+            'center_xz': center.astype(np.float32),
+            'altitude': float(altitude),
+        })
+
+    return specs
+
+
+def log_bev_figure(
+    buf_cord, buf_goal, buf_rewards, buf_dones,
+    buf_actions=None,
+    bev_images=None,
+    bev_metas=None,
+    obstacle_layouts=None,
+    grid_cols=None,
+    iteration=0,
+    save_dir=None,
+    wandb=None,
+):
+    """
+    Render Bird's-Eye-View trajectory plots in a grid layout.
+
+    Data layout
+    -----------
+    buf_cord    : (num_steps, num_envs, context_size*2)
+                  Flattened x,z position history.  buf_cord[t, e, -2:] gives
+                  the current robot (x_std, z_std) at step t in env e.
+    buf_goal    : (num_steps, num_envs, 2)
+                  Goal in world frame relative to the robot:
+                  goal_global = buf_cord[..., -2:] + buf_goal
+    buf_rewards : (num_steps, num_envs)
+    buf_dones   : (num_steps, num_envs)   1 at episode end
+    buf_actions : (num_steps, num_envs, 10)  optional - 5 cumulative
+                  waypoints x 2 in camera frame
+    bev_images  : list[ndarray | None]  - per-env BEV images from
+                  CarlaEnv.capture_bev(); None → plain axes background
+    bev_metas   : list[dict | None]     - corresponding projection metadata
+    obstacle_layouts : list[dict] or None
+                  Per-env obstacle layout data from get_obstacle_layouts().
+                  When provided, the per-agent geodesic path
+                  (``agents[i]['geodesic_path_std']``) is drawn as a cyan line.
+    grid_cols   : int or None - number of columns in the grid layout.
+                  When None, uses ceil(sqrt(num_envs)) for a roughly square grid.
+    """
+
+
+    num_steps, num_envs = buf_rewards.shape
+
+    # current (x, z) position at every step — buf_cord[t, e, -2:]
+    current_xz = buf_cord[:, :, -2:]          # (steps, envs, 2)
+    goal_global = current_xz + buf_goal       # (steps, envs, 2)
+
+    # ── sanity diagnostics ────────────────────────────────────────────
+    n_nan = int(np.isnan(current_xz).any(axis=-1).sum())
+    n_inf = int(np.isinf(current_xz).any(axis=-1).sum())
+    if n_nan or n_inf:
+        print(f"  [BEV] WARNING: trajectory has {n_nan} NaN and {n_inf} Inf entries")
+
+    # ── visual style (cohesive palette, all white-edged) ────────────
+    _TRAJ_COLOR = '#FFA726'          # warm amber — visible on BEV & plain bg
+    _MARKER = dict(
+        start=dict(marker='^', s=90, c='#43E97B', edgecolors='white',
+                   linewidths=1.2, zorder=5),
+        end=dict(marker='D', s=70, c='#F5576C', edgecolors='white',
+                 linewidths=1.2, zorder=5),
+        goal=dict(marker='*', s=260, c='#667EEA', edgecolors='white',
+                  linewidths=0.9, zorder=6),
+    )
+
+    # Layout: grid of BEV plots — no spacing between cells
+    if grid_cols is None:
+        grid_cols = math.ceil(math.sqrt(num_envs))
+    grid_rows = math.ceil(num_envs / grid_cols)
+    cell_size = 4.5
+    legend_frac = 0.045                     # fraction of height for legend
+    fig_h = cell_size * grid_rows / (1 - legend_frac)
+    fig, axes = plt.subplots(
+        grid_rows, grid_cols,
+        figsize=(cell_size * grid_cols, fig_h),
+        squeeze=False,
+    )
+    fig.subplots_adjust(left=0, right=1, top=1, bottom=legend_frac,
+                        wspace=0, hspace=0)
+
+    for env_idx in range(num_envs):
+        row_i, col_i = divmod(env_idx, grid_cols)
+        ax = axes[row_i][col_i]
+
+        # ── choose coordinate system ──────────────────────────────────
+        bev_img  = (bev_images or [None] * num_envs)[env_idx]
+        bev_meta = (bev_metas  or [None] * num_envs)[env_idx]
+        use_bev  = bev_img is not None and bev_meta is not None
+
+        def _to_plot(xz_arr):
+            """Convert (N, 2) standard-coord array to plot coords."""
+            if use_bev:
+                return _bev_world_to_pixel(xz_arr, bev_meta)
+            return xz_arr   # world coords directly
+
+        if use_bev:
+            s = bev_meta['img_size']
+            ax.imshow(bev_img, origin="upper",
+                      extent=[0, s, s, 0],   # (left, right, bottom, top)
+                      aspect="auto")
+            ax.set_xlim(0, s)
+            ax.set_ylim(s, 0)   # y-axis: 0 at top, s at bottom
+        else:
+            s = None
+            ax.set_aspect("auto")
+            ax.grid(True, alpha=0.3)
+        # strip all tick labels, ticks, and spines for compact grid
+        ax.set_xticks([])
+        ax.set_yticks([])
+        for spine in ax.spines.values():
+            spine.set_visible(False)
+
+        # ── geodesic path (from obstacle_layouts, if available) ────────
+        _geo_path_std = None
+        if obstacle_layouts is not None and env_idx < len(obstacle_layouts):
+            _layout = obstacle_layouts[env_idx]
+            _agents = _layout.get('agents', []) if _layout else []
+            _aidx = env_idx % len(_agents) if _agents else -1
+            _ag = _agents[_aidx] if 0 <= _aidx < len(_agents) else None
+            if _ag is not None:
+                _geo_path_std = _ag.get('geodesic_path_std')
+        if _geo_path_std is not None and len(_geo_path_std) >= 2:
+            _geo_plot = _to_plot(np.asarray(_geo_path_std))
+            _gv = np.isfinite(_geo_plot).all(axis=1)
+            _geo_plot_v = _geo_plot[_gv]
+            if len(_geo_plot_v) >= 2:
+                ax.plot(_geo_plot_v[:, 0], _geo_plot_v[:, 1],
+                        '-', color='#00E5FF', linewidth=1.2,
+                        alpha=0.55, zorder=2,
+                        label='geodesic' if env_idx == 0 else None)
+
+        # ── per-env trajectory data ───────────────────────────────────
+        xs = current_xz[:, env_idx, 0]
+        zs = current_xz[:, env_idx, 1]
+        dones = buf_dones[:, env_idx]
+
+        gx = goal_global[:, env_idx, 0]
+        gz = goal_global[:, env_idx, 1]
+
+        ep_starts = [0] + (np.where(dones[:-1] > 0)[0] + 1).tolist()
+        ep_ends   = np.where(dones > 0)[0].tolist() + [num_steps - 1]
+
+        for ep_i, (t0, t1) in enumerate(zip(ep_starts, ep_ends)):
+            ep_xz = np.stack([xs[t0:t1+1], zs[t0:t1+1]], axis=-1)  # (L, 2)
+
+            # skip episodes with NaN/Inf positions
+            valid = np.isfinite(ep_xz).all(axis=-1)
+            if not valid.any():
+                continue
+
+            # Diagnostic: verify goal-start distance for each episode.
+            # ep 0 is a continuation from the previous rollout, so its
+            # "start" is mid-episode — skip it to avoid misleading distances.
+            _goal_xz = np.array([gx[t0], gz[t0]])
+            _start_xz = ep_xz[0]
+            if np.isfinite(_goal_xz).all() and np.isfinite(_start_xz).all():
+                _gs_dist = float(np.linalg.norm(_goal_xz - _start_xz))
+                tag = "" if ep_i > 0 else " (continuation)"
+                print(f"  [BEV] env {env_idx} ep {ep_i}: "
+                      f"steps={t1-t0+1}  "
+                      f"goal-start dist={_gs_dist:.2f}m  "
+                      f"start=({_start_xz[0]:.1f}, {_start_xz[1]:.1f})  "
+                      f"goal=({_goal_xz[0]:.1f}, {_goal_xz[1]:.1f})"
+                      f"{tag}")
+
+            ep_plot = _to_plot(ep_xz)                                # (L, 2)
+
+            # ── trajectory line (single colour) ─────────────────────
+            L = len(ep_plot)
+            if L >= 2:
+                points = ep_plot.reshape(-1, 1, 2)
+                segments = np.concatenate([points[:-1], points[1:]], axis=1)
+                seg_valid = np.isfinite(segments).all(axis=(1, 2))
+                lc = LineCollection(
+                    segments[seg_valid],
+                    colors=_TRAJ_COLOR,
+                    linewidths=2.0,
+                    zorder=3,
+                )
+                ax.add_collection(lc)
+
+            # start / end (only plot if coordinates are finite)
+            if np.isfinite(ep_plot[0]).all():
+                ax.scatter(*ep_plot[0], **_MARKER['start'],
+                           label="start" if ep_i == 0 else None)
+            if np.isfinite(ep_plot[-1]).all():
+                ax.scatter(*ep_plot[-1], **_MARKER['end'],
+                           label="end" if ep_i == 0 else None)
+
+            # ── goal (★) ─────────────────────────────────────────────
+            goal_xz = np.array([gx[t0], gz[t0]])
+            if np.isfinite(goal_xz).all():
+                gp = _to_plot(goal_xz.reshape(1, 2))[0]
+                if np.isfinite(gp).all():
+                    ax.scatter(*gp, **_MARKER['goal'],
+                               label="goal" if ep_i == 0 else None)
+                    ax.plot([ep_plot[0, 0], gp[0]], [ep_plot[0, 1], gp[1]],
+                            "--", color="#667EEA", alpha=0.45, linewidth=1.0,
+                            zorder=2)
+            '''
+            # ── predicted waypoints (every ~8 samples) ───────────────
+            if buf_actions is not None and t1 > t0:
+                stride = max(1, (t1 - t0) // 8)
+                for t in range(t0, t1, stride):
+                    if not np.isfinite(xs[t]) or not np.isfinite(zs[t]):
+                        continue
+                    if t > 0 and np.isfinite(xs[t - 1]) and np.isfinite(zs[t - 1]):
+                        ddx = xs[t] - xs[t - 1]
+                        ddz = zs[t] - zs[t - 1]
+                    else:
+                        ddx, ddz = 0.0, 1e-6
+                    yaw = math.atan2(ddx, ddz)          # angle from +z axis
+                    cos_y, sin_y = math.cos(yaw), math.sin(yaw)
+                    # camera frame → world frame
+                    Rot = np.array([[cos_y, sin_y], [-sin_y, cos_y]])
+                    wp_cam = buf_actions[t, env_idx].reshape(5, 2)
+                    if not np.isfinite(wp_cam).all():
+                        continue
+                    wp_world = (Rot @ wp_cam.T).T + np.array([xs[t], zs[t]])
+                    wp_plot  = _to_plot(wp_world)                    # (5, 2)
+                    cur_plot = _to_plot(np.array([[xs[t], zs[t]]]))[0]
+                    ax.plot(
+                        [cur_plot[0]] + wp_plot[:, 0].tolist(),
+                        [cur_plot[1]] + wp_plot[:, 1].tolist(),
+                        "-", color="mediumpurple", linewidth=0.8, alpha=0.6,
+                        zorder=4,
+                        label="waypoints" if (ep_i == 0 and t == t0) else None,
+                    )
+                    ax.scatter(wp_plot[:, 0], wp_plot[:, 1],
+                               s=12, c="mediumpurple", alpha=0.6, zorder=4)
+            '''
+    # hide unused axes when num_envs doesn't fill the grid
+    for idx in range(num_envs, grid_rows * grid_cols):
+        r, c = divmod(idx, grid_cols)
+        axes[r][c].set_visible(False)
+
+    # ── shared legend (bottom-centre) ──────────────────────────────
+    from matplotlib.lines import Line2D
+    legend_handles = [
+        Line2D([], [], marker=_MARKER['start']['marker'], color='none',
+               markerfacecolor=_MARKER['start']['c'],
+               markeredgecolor='white', markersize=10, label='start'),
+        Line2D([], [], marker=_MARKER['end']['marker'], color='none',
+               markerfacecolor=_MARKER['end']['c'],
+               markeredgecolor='white', markersize=10, label='end'),
+        Line2D([], [], marker=_MARKER['goal']['marker'], color='none',
+               markerfacecolor=_MARKER['goal']['c'],
+               markeredgecolor='white', markersize=12, label='goal'),
+    ]
+    if obstacle_layouts is not None and any(
+        any(a.get('geodesic_path_std') is not None for a in l.get('agents', []))
+        for l in obstacle_layouts if l is not None
+    ):
+        legend_handles.append(
+            Line2D([], [], color='#00E5FF', linewidth=1.5,
+                   alpha=0.55, label='geodesic'))
+    fig.legend(handles=legend_handles, loc='lower center',
+               ncol=len(legend_handles), fontsize=11, framealpha=0.8,
+               borderpad=0.4, handletextpad=0.4, columnspacing=1.2)
+
+    # ── diagnostics ───────────────────────────────────────────────────
+    print(f"  [BEV] reward range: [{float(np.nanmin(buf_rewards)):.3f}, {float(np.nanmax(buf_rewards)):.3f}]")
+    for env_idx in range(num_envs):
+        xs_e = current_xz[:, env_idx, 0]
+        zs_e = current_xz[:, env_idx, 1]
+        print(f"  [BEV] env {env_idx}: x=[{np.nanmin(xs_e):.1f}, {np.nanmax(xs_e):.1f}] "
+              f"z=[{np.nanmin(zs_e):.1f}, {np.nanmax(zs_e):.1f}]")
+
+    if save_dir is not None:
+        os.makedirs(save_dir, exist_ok=True)
+        path = os.path.join(save_dir, f"bev_{iteration:04d}.png")
+        fig.savefig(path, dpi=120)
+        print(f"  → BEV figure saved to {path}")
+
+    if wandb is not None:
+        wandb.log({"rollout/bev_trajectories": wandb.Image(fig)}, step=iteration)
+
+    plt.close(fig)
+
+
+# ─── Obstacle Layout BEV Visualization ───────────────────────────────
+
+
+def log_obstacle_bev_figure(
+    obstacle_layouts,
+    bev_metas,
+    grid_cols=None,
+    iteration=0,
+    save_dir=None,
+    wandb=None,
+):
+    """
+    Render Bird's-Eye-View obstacle layout on a dark background.
+
+    Draws oriented bounding boxes for each spawned obstacle, filled
+    polygons for detected crosswalks, pedestrian trajectories, and
+    per-agent ego/goal markers with text annotations describing the
+    generation procedure and results.
+
+    Parameters
+    ----------
+    obstacle_layouts : list[dict]
+        Per-env data from ``VecCarlaMultiAgentEnv.get_obstacle_layouts()``.
+        Keys: ``'obstacles'``, ``'crosswalks'``, ``'pedestrians'``,
+        ``'agents'`` (per-agent metadata with ego/goal/method/scenarios).
+    bev_metas : list[dict | None]
+        Per-env projection metadata from ``capture_bev()``.
+    grid_cols : int or None
+    iteration : int
+    save_dir  : str or None
+    wandb     : wandb module or None
+    """
+    from matplotlib.patches import Patch, Polygon as MplPolygon
+    from matplotlib.collections import PolyCollection
+    from matplotlib.lines import Line2D
+
+    num_envs = len(obstacle_layouts)
+    if grid_cols is None:
+        grid_cols = math.ceil(math.sqrt(num_envs))
+    grid_rows = math.ceil(num_envs / grid_cols)
+    cell_size = 4.5
+    legend_frac = 0.06
+    fig_h = cell_size * grid_rows / (1 - legend_frac)
+
+    BG_COLOR = '#1A1A2E'
+
+    fig, axes = plt.subplots(
+        grid_rows, grid_cols,
+        figsize=(cell_size * grid_cols, fig_h),
+        squeeze=False,
+    )
+    fig.subplots_adjust(left=0, right=1, top=1, bottom=legend_frac,
+                        wspace=0, hspace=0)
+    fig.patch.set_facecolor(BG_COLOR)
+
+    # ── colour palette ────────────────────────────────────────────────
+    SCENARIO_COLORS = {
+        'blocked_crosswalk':       '#E53935',   # red
+        'crosswalk_challenge':     '#E53935',
+        'blocked_crosswalk_flank': '#FB8C00',   # orange
+        'narrow_passage':          '#FFB300',    # amber
+        'sidewalk_obstruction':    '#FDD835',    # yellow
+    }
+    # Segmentation layer colours (muted, semi-transparent)
+    SEG_SIDEWALK_COLOR = (0.42, 0.58, 0.72, 0.45)    # steel blue
+    SEG_CROSSWALK_COLOR = (0.85, 0.85, 0.25, 0.45)   # muted yellow
+    SEG_ROAD_COLOR = (0.30, 0.30, 0.30, 0.35)         # dark gray
+
+    CROSSWALK_COLOR  = '#29B6F6'         # light blue (polygon outlines)
+    CROSSWALK_ALPHA  = 0.35
+    OBSTACLE_ALPHA   = 0.75
+    PED_TRAJ_COLOR   = '#E040FB'         # magenta / pink
+    PED_MARKER_COLOR = '#F8F8F8'         # near-white
+    PED_DEST_COLOR   = '#CE93D8'         # light purple
+    EGO_COLOR        = '#43E97B'         # green (matches main BEV start)
+    GOAL_COLOR       = '#667EEA'         # blue  (matches main BEV goal)
+
+    # Human-readable labels for goal sampling methods
+    _METHOD_LABEL = {
+        'crosswalk_challenge': 'crosswalk challenge',
+        'navmesh_annulus':     'navmesh annulus',
+        'random_fallback':     'random fallback',
+    }
+    # Short labels for scenario names
+    _SCENARIO_LABEL = {
+        'blocked_crosswalk':    'blocked CW',
+        'crosswalk_challenge':  'CW challenge',
+        'sidewalk_obstruction': 'sidewalk clutter',
+        'narrow_passage':       'narrow passage',
+    }
+
+    for env_idx in range(num_envs):
+        row_i, col_i = divmod(env_idx, grid_cols)
+        ax = axes[row_i][col_i]
+
+        meta = (bev_metas or [None] * num_envs)[env_idx]
+        layout = obstacle_layouts[env_idx]
+        if meta is None or layout is None:
+            ax.set_visible(False)
+            continue
+
+        s = meta['img_size']
+        ax.set_facecolor(BG_COLOR)
+        ax.set_xlim(0, s)
+        ax.set_ylim(s, 0)
+        ax.set_xticks([])
+        ax.set_yticks([])
+        for spine in ax.spines.values():
+            spine.set_visible(False)
+
+        margin = s * 0.3
+
+        # ── navmesh segmentation layer (road → sidewalk → crosswalk) ─
+        for key, color in [('road_tris_std',      SEG_ROAD_COLOR),
+                           ('sidewalk_tris_std',  SEG_SIDEWALK_COLOR),
+                           ('crosswalk_tris_std', SEG_CROSSWALK_COLOR)]:
+            tris_std = layout.get(key)
+            if tris_std is None or len(tris_std) == 0:
+                continue
+            # tris_std: (N, 3, 2) standard coords → project to pixel
+            n_tris = len(tris_std)
+            flat = tris_std.reshape(-1, 2)
+            flat_px = _bev_world_to_pixel(flat, meta)
+            tri_px = flat_px.reshape(n_tris, 3, 2)
+            # Cull triangles entirely outside the image
+            in_x = (tri_px[:, :, 0] > -margin) & (tri_px[:, :, 0] < s + margin)
+            in_y = (tri_px[:, :, 1] > -margin) & (tri_px[:, :, 1] < s + margin)
+            visible = (in_x & in_y).any(axis=1)
+            if visible.any():
+                pc = PolyCollection(
+                    tri_px[visible], facecolors=[color],
+                    edgecolors='none', zorder=1)
+                ax.add_collection(pc)
+
+        # ── crosswalks (filled polygons + axes + centers) ─────────────
+        CW_CENTER_COLOR = '#FFFFFF'
+        CW_LONG_AXIS_COLOR = '#FF6F00'    # orange — road-parallel axis
+        CW_CROSS_AXIS_COLOR = '#00E676'   # green — crossing direction
+        CW_AXIS_LW = 1.5
+        CW_AXIS_ALPHA = 0.8
+
+        for cw_entry in layout.get('crosswalks', []):
+            # Support both dict (enriched) and plain ndarray (legacy)
+            if isinstance(cw_entry, dict):
+                cw_std = cw_entry['polygon_std']
+                cw_center = cw_entry.get('center_std')
+                cw_long = cw_entry.get('long_axis_std')
+                cw_cross = cw_entry.get('cross_axis_std')
+                cw_hl = cw_entry.get('half_length', 0)
+                cw_hw = cw_entry.get('half_width', 0)
+            else:
+                cw_std = cw_entry
+                cw_center = cw_long = cw_cross = None
+                cw_hl = cw_hw = 0
+
+            cw_px = _bev_world_to_pixel(cw_std, meta)
+            visible = np.any(
+                (cw_px[:, 0] > -margin) & (cw_px[:, 0] < s + margin) &
+                (cw_px[:, 1] > -margin) & (cw_px[:, 1] < s + margin))
+            if not visible:
+                continue
+
+            poly = MplPolygon(
+                cw_px, closed=True,
+                facecolor=CROSSWALK_COLOR, edgecolor='white',
+                alpha=CROSSWALK_ALPHA, linewidth=0.8, zorder=2,
+            )
+            ax.add_patch(poly)
+
+            '''
+            # Draw center and axes if available
+            if cw_center is not None:
+                center_px = _bev_world_to_pixel(
+                    np.asarray(cw_center).reshape(1, 2), meta)[0]
+                if np.isfinite(center_px).all():
+                    ax.plot(center_px[0], center_px[1], 'o',
+                            color=CW_CENTER_COLOR, markersize=4,
+                            markeredgecolor='black', markeredgewidth=0.6,
+                            zorder=7)
+
+                    if cw_long is not None and cw_hl > 0:
+                        # Long axis (road-parallel)
+                        long_end1 = cw_center + np.asarray(cw_long) * cw_hl
+                        long_end2 = cw_center - np.asarray(cw_long) * cw_hl
+                        ends_std = np.stack([long_end1, long_end2])
+                        ends_px = _bev_world_to_pixel(ends_std, meta)
+                        ax.plot(ends_px[:, 0], ends_px[:, 1],
+                                '-', color=CW_LONG_AXIS_COLOR,
+                                linewidth=CW_AXIS_LW, alpha=CW_AXIS_ALPHA,
+                                zorder=6)
+
+                    if cw_cross is not None and cw_hw > 0:
+                        # Cross axis (crossing direction)
+                        cross_end1 = cw_center + np.asarray(cw_cross) * cw_hw
+                        cross_end2 = cw_center - np.asarray(cw_cross) * cw_hw
+                        ends_std = np.stack([cross_end1, cross_end2])
+                        ends_px = _bev_world_to_pixel(ends_std, meta)
+                        ax.plot(ends_px[:, 0], ends_px[:, 1],
+                                '-', color=CW_CROSS_AXIS_COLOR,
+                                linewidth=CW_AXIS_LW, alpha=CW_AXIS_ALPHA,
+                                zorder=6)
+            '''
+        # ── obstacles (oriented bounding boxes) ──────────────────────
+        for obs in layout.get('obstacles', []):
+            corners_px = _bev_world_to_pixel(obs['corners_std'], meta)
+            if np.any((corners_px[:, 0] > -margin) & (corners_px[:, 0] < s + margin) &
+                       (corners_px[:, 1] > -margin) & (corners_px[:, 1] < s + margin)):
+                color = SCENARIO_COLORS.get(obs['scenario_type'], '#FFFFFF')
+                poly = MplPolygon(
+                    corners_px, closed=True,
+                    facecolor=color, edgecolor='white',
+                    alpha=OBSTACLE_ALPHA, linewidth=1.0, zorder=3,
+                )
+                ax.add_patch(poly)
+
+        # ── pedestrians (trajectories + current position) ────────────
+        for ped in layout.get('pedestrians', []):
+            traj = ped['trajectory_std']
+            traj_px = _bev_world_to_pixel(traj, meta)
+
+            if len(traj_px) >= 2:
+                seg_valid = np.isfinite(traj_px).all(axis=1)
+                traj_px_v = traj_px[seg_valid]
+                if len(traj_px_v) >= 2:
+                    ax.plot(traj_px_v[:, 0], traj_px_v[:, 1],
+                            '-', color=PED_TRAJ_COLOR, linewidth=1.0,
+                            alpha=0.7, zorder=4)
+
+            pos_px = _bev_world_to_pixel(
+                ped['position_std'].reshape(1, 2), meta)[0]
+            if (0 <= pos_px[0] <= s and 0 <= pos_px[1] <= s):
+                ax.plot(pos_px[0], pos_px[1], 'o',
+                        color=PED_MARKER_COLOR, markersize=3,
+                        markeredgecolor=PED_TRAJ_COLOR,
+                        markeredgewidth=0.6, zorder=5)
+
+            if ped.get('destination_std') is not None:
+                dest_px = _bev_world_to_pixel(
+                    ped['destination_std'].reshape(1, 2), meta)[0]
+                if (0 <= dest_px[0] <= s and 0 <= dest_px[1] <= s):
+                    ax.plot(dest_px[0], dest_px[1], 'x',
+                            color=PED_DEST_COLOR, markersize=3,
+                            markeredgewidth=0.8, alpha=0.6, zorder=4)
+
+        # ── per-agent annotations (ego, goal, metadata) ──────────────
+        agents = layout.get('agents', [])
+        # Map flat env_idx to the per-server agent index.  All agents on
+        # one server share the same layout dict, so the agent list length
+        # equals the number of agents per server.
+        agent_idx_local = env_idx % len(agents) if agents else -1
+        agent = agents[agent_idx_local] if 0 <= agent_idx_local < len(agents) else None
+
+        if agent is not None:
+            ego_std = np.asarray(agent['ego_std'])
+            goal_std = np.asarray(agent['goal_std'])
+
+            ego_px = _bev_world_to_pixel(ego_std.reshape(1, 2), meta)[0]
+            goal_px = _bev_world_to_pixel(goal_std.reshape(1, 2), meta)[0]
+
+            # Geodesic path (replaces dashed ego→goal line when available)
+            geo_path_std = agent.get('geodesic_path_std')
+            if geo_path_std is not None and len(geo_path_std) >= 2:
+                geo_px = _bev_world_to_pixel(np.asarray(geo_path_std), meta)
+                geo_valid = np.isfinite(geo_px).all(axis=1)
+                geo_px_v = geo_px[geo_valid]
+                if len(geo_px_v) >= 2:
+                    ax.plot(geo_px_v[:, 0], geo_px_v[:, 1],
+                            '-', color='#00E5FF', linewidth=1.5,
+                            alpha=0.7, zorder=6)
+            elif np.isfinite(ego_px).all() and np.isfinite(goal_px).all():
+                # Fallback: dashed straight line from ego to goal
+                ax.plot([ego_px[0], goal_px[0]], [ego_px[1], goal_px[1]],
+                        '--', color=GOAL_COLOR, alpha=0.45,
+                        linewidth=1.0, zorder=6)
+
+            # Ego marker (green triangle)
+            if np.isfinite(ego_px).all():
+                ax.scatter(ego_px[0], ego_px[1], marker='^', s=90,
+                           c=EGO_COLOR, edgecolors='white',
+                           linewidths=1.0, zorder=8)
+
+            # Goal marker (blue star)
+            if np.isfinite(goal_px).all():
+                ax.scatter(goal_px[0], goal_px[1], marker='*', s=200,
+                           c=GOAL_COLOR, edgecolors='white',
+                           linewidths=0.8, zorder=8)
+
+            # ── text info box (top-left of each cell) ────────────────
+            town = agent.get('town', '?')
+            quadrant = agent.get('quadrant', '?')
+            goal_method = agent.get('goal_method', '')
+            init_dist = agent.get('initial_distance', 0.0)
+            geo_dist = agent.get('geodesic_distance', None)
+            step_count = agent.get('step_count', 0)
+            region_scenarios = agent.get('region_scenarios', [])
+
+            method_label = _METHOD_LABEL.get(goal_method, goal_method or '?')
+            scenario_strs = [_SCENARIO_LABEL.get(sc, sc)
+                             for sc in region_scenarios]
+
+            lines = [f'env {env_idx}  {town} ({quadrant})']
+            dist_str = f'd={init_dist:.1f}m'
+            if geo_dist is not None and np.isfinite(geo_dist):
+                dist_str += f'  geo={geo_dist:.1f}m'
+            lines.append(f'goal: {method_label}  {dist_str}')
+            if scenario_strs:
+                lines.append('obs: ' + ', '.join(scenario_strs))
+            else:
+                lines.append('obs: none')
+            lines.append(f'step: {step_count}')
+
+            info_text = '\n'.join(lines)
+            ax.text(4, 4, info_text, fontsize=5.5, color='white',
+                    alpha=0.85, family='monospace',
+                    verticalalignment='top', zorder=10,
+                    bbox=dict(boxstyle='round,pad=0.3',
+                              facecolor='#0D0D1A', edgecolor='none',
+                              alpha=0.7))
+        else:
+            # No agent metadata — minimal label
+            ax.text(5, 15, f'env {env_idx}', fontsize=7, color='white',
+                    alpha=0.7, zorder=10)
+
+    # hide unused axes
+    for idx in range(num_envs, grid_rows * grid_cols):
+        r, c = divmod(idx, grid_cols)
+        axes[r][c].set_visible(False)
+
+    # ── legend ────────────────────────────────────────────────────────
+    # Check if segmentation data is present
+    has_seg = any(layout.get('sidewalk_tris_std') is not None
+                  and len(layout.get('sidewalk_tris_std', [])) > 0
+                  for layout in obstacle_layouts)
+
+    legend_handles = []
+    if has_seg:
+        legend_handles.extend([
+            Patch(facecolor=SEG_ROAD_COLOR, edgecolor='none',
+                  label='road'),
+            Patch(facecolor=SEG_SIDEWALK_COLOR, edgecolor='none',
+                  label='sidewalk'),
+            Patch(facecolor=SEG_CROSSWALK_COLOR, edgecolor='none',
+                  label='crosswalk'),
+        ])
+    else:
+        legend_handles.append(
+            Patch(facecolor=CROSSWALK_COLOR, edgecolor='white',
+                  alpha=CROSSWALK_ALPHA, label='crosswalk'))
+
+    legend_handles.extend([
+        Patch(facecolor='#E53935', edgecolor='white',
+              alpha=OBSTACLE_ALPHA, label='blocker / CW challenge'),
+        Patch(facecolor='#FB8C00', edgecolor='white',
+              alpha=OBSTACLE_ALPHA, label='barrier'),
+        Patch(facecolor='#FFB300', edgecolor='white',
+              alpha=OBSTACLE_ALPHA, label='narrow passage'),
+        Patch(facecolor='#FDD835', edgecolor='white',
+              alpha=OBSTACLE_ALPHA, label='sidewalk clutter'),
+        Line2D([], [], marker='^', color='none', markerfacecolor=EGO_COLOR,
+               markeredgecolor='white', markersize=8, label='ego'),
+        Line2D([], [], marker='*', color='none', markerfacecolor=GOAL_COLOR,
+               markeredgecolor='white', markersize=10, label='goal'),
+    ])
+    has_geo = any(
+        any(a.get('geodesic_path_std') is not None
+            for a in l.get('agents', []))
+        for l in obstacle_layouts)
+    if has_geo:
+        legend_handles.append(
+            Line2D([], [], color='#00E5FF', linewidth=1.5,
+                   alpha=0.7, label='geodesic path'))
+    has_peds = any(len(l.get('pedestrians', [])) > 0
+                   for l in obstacle_layouts)
+    if has_peds:
+        legend_handles.append(
+            Line2D([], [], color=PED_TRAJ_COLOR, linewidth=1.5,
+                   marker='o', markersize=4, markerfacecolor=PED_MARKER_COLOR,
+                   markeredgecolor=PED_TRAJ_COLOR, markeredgewidth=0.6,
+                   label='pedestrian'))
+    # Crosswalk axes (only when enriched crosswalk data is present)
+    has_cw_axes = any(
+        any(isinstance(cw, dict) and cw.get('long_axis_std') is not None
+            for cw in l.get('crosswalks', []))
+        for l in obstacle_layouts)
+    if has_cw_axes:
+        legend_handles.extend([
+            Line2D([], [], color='#FF6F00', linewidth=1.5,
+                   alpha=0.8, label='CW long axis'),
+            Line2D([], [], color='#00E676', linewidth=1.5,
+                   alpha=0.8, label='CW cross axis'),
+        ])
+
+    ncol = min(len(legend_handles), 8)
+    fig.legend(handles=legend_handles, loc='lower center',
+               ncol=ncol, fontsize=8, framealpha=0.8,
+               borderpad=0.4, handletextpad=0.3, columnspacing=0.8,
+               facecolor='#2A2A3E', edgecolor='gray', labelcolor='white')
+
+    n_obs = sum(len(l.get('obstacles', [])) for l in obstacle_layouts)
+    n_cw = sum(len(l.get('crosswalks', [])) for l in obstacle_layouts)
+    n_ped = sum(len(l.get('pedestrians', [])) for l in obstacle_layouts)
+    print(f"  [Obstacle BEV] {n_obs} obstacles, {n_cw} crosswalk polygons, "
+          f"{n_ped} pedestrians across {num_envs} envs")
+
+    if save_dir is not None:
+        os.makedirs(save_dir, exist_ok=True)
+        path = os.path.join(save_dir, f"obstacle_bev_{iteration:04d}.png")
+        fig.savefig(path, dpi=120, facecolor=BG_COLOR)
+        print(f"  -> Obstacle BEV figure saved to {path}")
+
+    if wandb is not None:
+        wandb.log({"rollout/obstacle_bev": wandb.Image(fig)}, step=iteration)
+
+    plt.close(fig)
+
+
+# ─── Complete-Episode BEV Visualization ──────────────────────────────
+
+
+def compute_episode_bev_specs(buf_cord, buf_goal, buf_dones,
+                              continuation_spawns,
+                              default_altitude=15.0, fov=90.0):
+    """Compute BEV capture specs for every episode visible in the rollout.
+
+    Parameters
+    ----------
+    buf_cord             : (T, E, ctx*2)  position history
+    buf_goal             : (T, E, 2)      goal_world (relative to agent)
+    buf_dones            : (T, E)         done flags
+    continuation_spawns  : (E, 2)         spawn of each env's continuation ep
+    default_altitude     : minimum BEV altitude (metres)
+    fov                  : horizontal FOV (degrees)
+
+    Returns
+    -------
+    specs : list of dict  – one per episode, with keys
+        ``env_idx``, ``ep_idx``, ``center_xz``, ``altitude``
+    ep_key_to_spec_idx : dict  (env_idx, ep_idx) -> index in *specs*
+    """
+    num_steps, num_envs = buf_dones.shape
+    current_xz = buf_cord[:, :, -2:]                # (T, E, 2)
+    goal_global = current_xz + buf_goal             # (T, E, 2)
+
+    specs = []
+    ep_key_to_spec_idx = {}
+
+    for env_idx in range(num_envs):
+        dones = buf_dones[:, env_idx]
+        ep_starts = [0] + (np.where(dones[:-1] > 0)[0] + 1).tolist()
+        ep_ends = np.where(dones > 0)[0].tolist() + [num_steps - 1]
+
+        for ep_i, (t0, t1) in enumerate(zip(ep_starts, ep_ends)):
+            # Spawn position
+            if ep_i == 0:
+                spawn = continuation_spawns[env_idx]
+            else:
+                spawn = current_xz[t0, env_idx]
+
+            goal = goal_global[t0, env_idx]
+            traj = current_xz[t0:t1 + 1, env_idx]   # (L, 2)
+
+            # Bounding box of spawn + goal + trajectory
+            all_pts = np.vstack([spawn.reshape(1, 2),
+                                 goal.reshape(1, 2),
+                                 traj])
+            bb_min = np.nanmin(all_pts, axis=0)
+            bb_max = np.nanmax(all_pts, axis=0)
+            center = (bb_min + bb_max) / 2.0
+            half_ext = np.max((bb_max - bb_min) / 2.0) + 5.0  # margin
+
+            fov_rad = np.deg2rad(fov)
+            altitude = half_ext / np.tan(fov_rad / 2.0)
+            altitude = max(altitude, default_altitude)
+
+            key = (env_idx, ep_i)
+            ep_key_to_spec_idx[key] = len(specs)
+            specs.append({
+                'env_idx': env_idx,
+                'ep_idx': ep_i,
+                'center_xz': center.astype(np.float32),
+                'altitude': float(altitude),
+                'spawn_xz': np.asarray(spawn, dtype=np.float32),
+            })
+
+    return specs, ep_key_to_spec_idx
+
+
+def log_complete_episode_bev(
+    buf_cord, buf_goal, buf_rewards, buf_dones,
+    continuation_spawns,
+    bev_results, ep_key_to_spec_idx,
+    grid_cols=None,
+    iteration=0,
+    save_dir=None,
+    wandb=None,
+):
+    """Render BEV trajectory plots with per-episode backgrounds.
+
+    Each episode in the rollout gets its own BEV image centred on the
+    episode's bounding box (spawn + goal + trajectory), so continuation
+    episodes that started in a previous rollout are shown correctly.
+
+    Parameters
+    ----------
+    buf_cord, buf_goal, buf_rewards, buf_dones : rollout buffers
+    continuation_spawns : (E, 2)  spawn of each env's continuation episode
+    bev_results         : list of (img, meta) | None, indexed by spec order
+    ep_key_to_spec_idx  : dict  (env_idx, ep_idx) -> index in bev_results
+    grid_cols           : columns in the grid (None → ceil(sqrt(E)))
+    """
+    num_steps, num_envs = buf_rewards.shape
+    current_xz = buf_cord[:, :, -2:]
+    goal_global = current_xz + buf_goal
+
+    # ── visual style (same as log_bev_figure) ──
+    _TRAJ_COLOR = '#FFA726'
+    _MARKER = dict(
+        start=dict(marker='^', s=90, c='#43E97B', edgecolors='white',
+                   linewidths=1.2, zorder=5),
+        end=dict(marker='D', s=70, c='#F5576C', edgecolors='white',
+                 linewidths=1.2, zorder=5),
+        goal=dict(marker='*', s=260, c='#667EEA', edgecolors='white',
+                  linewidths=0.9, zorder=6),
+        spawn=dict(marker='o', s=60, c='#00E5FF', edgecolors='white',
+                   linewidths=1.0, zorder=5),
+    )
+
+    if grid_cols is None:
+        grid_cols = math.ceil(math.sqrt(num_envs))
+    grid_rows = math.ceil(num_envs / grid_cols)
+    cell_size = 4.5
+    legend_frac = 0.045
+    fig_h = cell_size * grid_rows / (1 - legend_frac)
+    fig, axes = plt.subplots(
+        grid_rows, grid_cols,
+        figsize=(cell_size * grid_cols, fig_h),
+        squeeze=False,
+    )
+    fig.subplots_adjust(left=0, right=1, top=1, bottom=legend_frac,
+                        wspace=0, hspace=0)
+
+    for env_idx in range(num_envs):
+        row_i, col_i = divmod(env_idx, grid_cols)
+        ax = axes[row_i][col_i]
+
+        dones = buf_dones[:, env_idx]
+        xs = current_xz[:, env_idx, 0]
+        zs = current_xz[:, env_idx, 1]
+        gx = goal_global[:, env_idx, 0]
+        gz = goal_global[:, env_idx, 1]
+
+        ep_starts = [0] + (np.where(dones[:-1] > 0)[0] + 1).tolist()
+        ep_ends = np.where(dones > 0)[0].tolist() + [num_steps - 1]
+
+        # Use the BEV with the widest coverage (highest altitude) so
+        # that points from all episodes have the best chance of falling
+        # within the image bounds.
+        bev_img, bev_meta = None, None
+        best_alt = -1.0
+        for ep_i in range(len(ep_starts)):
+            key = (env_idx, ep_i)
+            spec_idx = ep_key_to_spec_idx.get(key)
+            if spec_idx is not None and bev_results[spec_idx] is not None:
+                candidate_img, candidate_meta = bev_results[spec_idx]
+                if candidate_img is not None:
+                    alt = candidate_meta.get('altitude', 0.0)
+                    if alt > best_alt:
+                        bev_img, bev_meta = candidate_img, candidate_meta
+                        best_alt = alt
+
+        use_bev = bev_img is not None and bev_meta is not None
+
+        def _to_plot(xz_arr):
+            if use_bev:
+                return _bev_world_to_pixel(xz_arr, bev_meta)
+            return xz_arr
+
+        if use_bev:
+            s = bev_meta['img_size']
+            ax.imshow(bev_img, origin="upper",
+                      extent=[0, s, s, 0], aspect="auto")
+            ax.set_xlim(0, s)
+            ax.set_ylim(s, 0)
+        else:
+            s = None
+            ax.set_aspect("auto")
+            ax.grid(True, alpha=0.3)
+        ax.set_xticks([])
+        ax.set_yticks([])
+        for spine in ax.spines.values():
+            spine.set_visible(False)
+
+        # ── draw each episode ──
+        for ep_i, (t0, t1) in enumerate(zip(ep_starts, ep_ends)):
+            ep_xz = np.stack([xs[t0:t1 + 1], zs[t0:t1 + 1]], axis=-1)
+            valid = np.isfinite(ep_xz).all(axis=-1)
+            if not valid.any():
+                continue
+
+            # Spawn position
+            if ep_i == 0:
+                spawn_xz = continuation_spawns[env_idx]
+            else:
+                spawn_xz = ep_xz[0]
+
+            _goal_xz = np.array([gx[t0], gz[t0]])
+
+            # Diagnostic
+            if np.isfinite(spawn_xz).all() and np.isfinite(_goal_xz).all():
+                _gs_dist = float(np.linalg.norm(_goal_xz - spawn_xz))
+                tag = " (continuation)" if ep_i == 0 else ""
+                print(f"  [BEV-ep] env {env_idx} ep {ep_i}: "
+                      f"steps={t1 - t0 + 1}  "
+                      f"goal-spawn dist={_gs_dist:.2f}m  "
+                      f"spawn=({spawn_xz[0]:.1f}, {spawn_xz[1]:.1f})  "
+                      f"goal=({_goal_xz[0]:.1f}, {_goal_xz[1]:.1f})"
+                      f"{tag}")
+
+            ep_plot = _to_plot(ep_xz)
+
+            # Trajectory line
+            L = len(ep_plot)
+            if L >= 2:
+                points = ep_plot.reshape(-1, 1, 2)
+                segments = np.concatenate([points[:-1], points[1:]], axis=1)
+                seg_valid = np.isfinite(segments).all(axis=(1, 2))
+                lc = LineCollection(
+                    segments[seg_valid],
+                    colors=_TRAJ_COLOR,
+                    linewidths=2.0,
+                    zorder=3,
+                )
+                ax.add_collection(lc)
+
+            # Start / end markers (current rollout segment)
+            if np.isfinite(ep_plot[0]).all():
+                ax.scatter(*ep_plot[0], **_MARKER['start'],
+                           label="start" if ep_i == 0 else None)
+            if np.isfinite(ep_plot[-1]).all():
+                ax.scatter(*ep_plot[-1], **_MARKER['end'],
+                           label="end" if ep_i == 0 else None)
+
+            # Spawn marker (true episode start, may differ from rollout start)
+            if ep_i == 0 and np.isfinite(spawn_xz).all():
+                sp = _to_plot(spawn_xz.reshape(1, 2))[0]
+                if (not use_bev) or (0 <= sp[0] < s and 0 <= sp[1] < s):
+                    ax.scatter(*sp, **_MARKER['spawn'],
+                               label="spawn" if ep_i == 0 else None)
+
+            # Goal
+            if np.isfinite(_goal_xz).all():
+                gp = _to_plot(_goal_xz.reshape(1, 2))[0]
+                margin = 20
+                in_bounds = (not use_bev) or (
+                    -margin < gp[0] < s + margin and
+                    -margin < gp[1] < s + margin)
+                if in_bounds:
+                    ax.scatter(*gp, **_MARKER['goal'],
+                               label="goal" if ep_i == 0 else None)
+                    # Dashed line from spawn to goal
+                    if np.isfinite(spawn_xz).all():
+                        sp = _to_plot(spawn_xz.reshape(1, 2))[0]
+                        ax.plot([sp[0], gp[0]], [sp[1], gp[1]],
+                                "--", color="#667EEA", alpha=0.45,
+                                linewidth=1.0, zorder=2)
+
+    # Hide unused axes
+    for idx in range(num_envs, grid_rows * grid_cols):
+        r, c = divmod(idx, grid_cols)
+        axes[r][c].set_visible(False)
+
+    # Shared legend
+    from matplotlib.lines import Line2D
+    legend_handles = [
+        Line2D([], [], marker='^', color='none',
+               markerfacecolor='#43E97B', markeredgecolor='white',
+               markersize=10, label='start'),
+        Line2D([], [], marker='D', color='none',
+               markerfacecolor='#F5576C', markeredgecolor='white',
+               markersize=10, label='end'),
+        Line2D([], [], marker='*', color='none',
+               markerfacecolor='#667EEA', markeredgecolor='white',
+               markersize=12, label='goal'),
+        Line2D([], [], marker='o', color='none',
+               markerfacecolor='#00E5FF', markeredgecolor='white',
+               markersize=8, label='spawn'),
+    ]
+    fig.legend(handles=legend_handles, loc='lower center',
+               ncol=4, fontsize=11, framealpha=0.8,
+               borderpad=0.4, handletextpad=0.4, columnspacing=1.2)
+
+    if save_dir is not None:
+        os.makedirs(save_dir, exist_ok=True)
+        path = os.path.join(save_dir, f"bev_episodes_{iteration:04d}.png")
+        fig.savefig(path, dpi=120)
+        print(f"  → complete-episode BEV saved to {path}")
+
+    if wandb is not None:
+        wandb.log({"rollout/bev_complete_episodes": wandb.Image(fig)},
+                  step=iteration)
+
+    plt.close(fig)
+
+
+# ─── Ego-View Video ───────────────────────────────────────────────────
+
+
+def _annotate_ego_frames(frames, rewards=None, dones=None, goals=None,
+                         terminateds=None):
+    """
+    Add per-step overlays to a sequence of RGB frames.
+
+    Overlays
+    --------
+    * Top-left text  : step index, per-step reward, cumulative reward,
+      goal distance.
+    * Green tint + "SUCCESS" on terminated steps (goal reached).
+    * Red tint + "TRUNCATED" on truncated steps (time limit).
+    * Top-right minimap: ego-centric bird's-eye square showing the agent
+      (centre, facing up) and goal position with distance rings.
+    * Goal projection onto the ego view (pinhole model).
+
+    Parameters
+    ----------
+    frames      : (T, H, W, 3) uint8
+    rewards     : (T,) float  or None
+    dones       : (T,) float  or None  - 1.0 at any episode boundary
+    goals       : (T, 2) float or None - (goal_x_std, goal_z_std), relative
+    terminateds : (T,) float  or None  - 1.0 only at true terminations (success)
+
+    Returns : (T, H, W, 3) uint8
+    """
+    try:
+        from PIL import Image, ImageDraw
+    except ImportError:
+        print("  [video] Pillow not found; frames will have no annotation. "
+              "Run: pip install Pillow")
+        return frames
+
+    T, H, W = frames.shape[:3]
+    out = []
+    cum_r = 0.0
+
+    for t in range(T):
+        # ── base frame ────────────────────────────────────────────────
+        arr = frames[t].copy()
+        is_done = dones is not None and dones[t] > 0
+        is_terminated = (terminateds is not None and terminateds[t] > 0)
+        is_truncated = is_done and not is_terminated
+
+        # colour tint: green for success, red for truncation
+        if is_done:
+            arr = arr.astype(np.float32)
+            if is_terminated:
+                arr[..., 0] = np.clip(arr[..., 0] * 0.4,        0, 255)
+                arr[..., 1] = np.clip(arr[..., 1] * 0.4 + 153,  0, 255)
+                arr[..., 2] = np.clip(arr[..., 2] * 0.4,        0, 255)
+            else:
+                arr[..., 0] = np.clip(arr[..., 0] * 0.4 + 153,  0, 255)
+                arr[..., 1] = np.clip(arr[..., 1] * 0.4,        0, 255)
+                arr[..., 2] = np.clip(arr[..., 2] * 0.4,        0, 255)
+            arr = arr.astype(np.uint8)
+
+        img  = Image.fromarray(arr)
+        draw = ImageDraw.Draw(img)
+
+        # ── text overlay ──────────────────────────────────────────────
+        lines = [f"step {t + 1:3d}/{T}"]
+        if rewards is not None:
+            r = float(rewards[t])
+            cum_r += r
+            lines.append(f"r   = {r:+.3f}")
+            lines.append(f"cum = {cum_r:+.2f}")
+
+        # always show distance to goal
+        if goals is not None:
+            gx = float(goals[t, 0])
+            gz = float(goals[t, 1])
+            dist = math.sqrt(gx ** 2 + gz ** 2) + 1e-8
+            lines.append(f"dist= {dist:.1f}m")
+        else:
+            dist = None
+
+        if is_done:
+            if is_terminated:
+                lines.append("SUCCESS")
+            else:
+                lines.append("TRUNCATED")
+            cum_r = 0.0   # reset AFTER including terminal reward in display
+
+        for i, line in enumerate(lines):
+            y = 4 + i * 15
+            draw.text((5, y), line, fill=(0, 0, 0))       # shadow
+            draw.text((4, y - 1), line, fill=(255, 255, 0))
+
+        # ── goal projection onto ego view ────────────────────────────────
+        # Project the goal onto the image plane using a pinhole model.
+        # Standard coords: x = right, y = up, z = forward.
+        # Camera intrinsics: 640×480, 110° horizontal FOV (stack_omr4.json).
+        # Camera height ~0.73 m above ground → ground is at y = -0.73 in cam frame.
+        if goals is not None:
+            # pinhole focal length (horizontal FOV)
+            fov_h_rad = math.radians(110.0)
+            fx = W / (2.0 * math.tan(fov_h_rad / 2.0))
+            cam_height = 0.73  # metres above ground
+
+            # project goal onto image if in front of camera
+            if gz > 0.5:
+                u = fx * gx / gz + W / 2.0
+                v = fx * cam_height / gz + H / 2.0  # ground plane → v > H/2
+
+                # clamp u to frame bounds for the marker
+                u_clamped = max(0, min(W - 1, u))
+                in_frame = 0 <= u < W
+
+                color = (0, 255, 100) if in_frame else (255, 80, 80)
+
+                # vertical guide line (dashed effect via short segments)
+                for yy in range(0, H, 8):
+                    draw.line([(u_clamped, yy), (u_clamped, min(yy + 4, H))],
+                              fill=(*color, 120), width=1)
+
+                # diamond marker at projected ground point (or frame edge)
+                mv = min(max(v, 0), H - 1)
+                r_diamond = 6
+                draw.polygon([
+                    (u_clamped, mv - r_diamond),
+                    (u_clamped + r_diamond, mv),
+                    (u_clamped, mv + r_diamond),
+                    (u_clamped - r_diamond, mv),
+                ], fill=color, outline=(255, 255, 255))
+
+                # distance label near the marker
+                dist_txt = f"{dist:.0f}m"
+                draw.text((u_clamped + r_diamond + 2, mv - 7), dist_txt,
+                          fill=(0, 0, 0))
+                draw.text((u_clamped + r_diamond + 1, mv - 8), dist_txt,
+                          fill=color)
+
+            # ── ego-centric minimap (top-right) ──────────────────────────
+            # Square minimap with the agent at centre facing up (+z).
+            # Goal shown as a dot at correct relative position.
+            # Distance rings provide scale reference.
+            ms = 80              # minimap size (px)
+            margin = 6
+            mx = W - ms - margin # top-left x of minimap
+            my = margin          # top-left y of minimap
+
+            # semi-transparent dark background
+            overlay = Image.new('RGBA', (ms, ms), (20, 20, 30, 200))
+            overlay_draw = ImageDraw.Draw(overlay)
+
+            # auto-scale: fit goal with 20% margin, minimum 5m radius
+            map_radius = max(dist * 1.2, 5.0)
+            scale = (ms / 2.0 - 4) / map_radius   # px per metre
+
+            centre = ms / 2.0
+
+            # distance rings (concentric circles for scale)
+            ring_distances = _minimap_ring_distances(map_radius)
+            for rd in ring_distances:
+                rr = rd * scale
+                if rr < 3 or rr > centre - 2:
+                    continue
+                overlay_draw.ellipse(
+                    [centre - rr, centre - rr, centre + rr, centre + rr],
+                    outline=(80, 80, 80, 160), width=1)
+                # distance label on the ring (right side)
+                label = f"{rd:.0f}" if rd >= 1 else f"{rd:.1f}"
+                overlay_draw.text((centre + rr - 8, centre - 10),
+                                  label, fill=(120, 120, 120, 200))
+
+            # agent marker: small upward triangle at centre
+            a_size = 5
+            overlay_draw.polygon([
+                (centre, centre - a_size - 1),
+                (centre - a_size, centre + a_size - 1),
+                (centre + a_size, centre + a_size - 1),
+            ], fill=(255, 255, 255, 230), outline=(200, 200, 200, 255))
+
+            # agent forward indicator: thin line upward from agent
+            overlay_draw.line(
+                [(centre, centre - a_size - 1), (centre, centre - a_size - 6)],
+                fill=(100, 255, 100, 200), width=1)
+
+            # goal marker: bright dot at relative position
+            # In ego frame: x = right, z = forward → minimap: u = right, v = up
+            goal_u = centre + gx * scale
+            goal_v = centre - gz * scale   # forward → up in image
+            goal_r = 5
+            # pulsing glow effect: outer ring
+            overlay_draw.ellipse(
+                [goal_u - goal_r - 2, goal_v - goal_r - 2,
+                 goal_u + goal_r + 2, goal_v + goal_r + 2],
+                fill=(255, 200, 50, 80))
+            # solid goal dot
+            overlay_draw.ellipse(
+                [goal_u - goal_r, goal_v - goal_r,
+                 goal_u + goal_r, goal_v + goal_r],
+                fill=(255, 200, 50, 255), outline=(255, 255, 255, 255))
+
+            # border
+            overlay_draw.rectangle(
+                [0, 0, ms - 1, ms - 1],
+                outline=(180, 180, 180, 200), width=1)
+
+            # composite minimap onto frame
+            img.paste(
+                Image.fromarray(
+                    np.array(overlay.convert('RGB'), dtype=np.uint8)),
+                (mx, my),
+                mask=overlay.split()[3])
+
+            # distance text below minimap
+            draw = ImageDraw.Draw(img)  # refresh draw after paste
+            dist_label = f"{dist:.1f}m"
+            tw = draw.textlength(dist_label) if hasattr(draw, 'textlength') else len(dist_label) * 6
+            tx = mx + ms / 2 - tw / 2
+            ty = my + ms + 2
+            draw.text((tx + 1, ty + 1), dist_label, fill=(0, 0, 0))
+            draw.text((tx, ty), dist_label, fill=(255, 200, 50))
+
+        out.append(np.array(img, dtype=np.uint8))
+
+    return np.array(out, dtype=np.uint8)
+
+
+def _minimap_ring_distances(map_radius):
+    """Choose clean distance-ring values for the minimap."""
+    # Pick 2-3 rings at round intervals
+    candidates = [1, 2, 5, 10, 15, 20, 25, 30, 50, 75, 100]
+    rings = [c for c in candidates if 0.15 * map_radius < c < 0.95 * map_radius]
+    if not rings:
+        rings = [map_radius * 0.5]
+    return rings[:3]
+
+
+def _write_video(frames, base_path, fps):
+    """
+    Write *frames* (T, H, W, 3) uint8 to disk.
+
+    Tries MP4 first (requires imageio-ffmpeg), falls back to GIF.
+    Returns the path of the file actually written, or None on failure.
+    """
+    import imageio
+
+    for ext, kwargs in [
+        (".mp4", {"fps": fps, "quality": 7, "macro_block_size": 1}),
+        (".gif", {"fps": fps, "loop": 0}),
+    ]:
+        path = base_path + ext
+        try:
+            imageio.mimwrite(path, frames, **kwargs)
+            return path
+        except Exception:
+            pass
+
+    print("  [video] could not write MP4 or GIF — "
+          "install imageio-ffmpeg for MP4 support.")
+    return None
+
+
+def log_ego_video_grid(
+    buf_obs,
+    buf_rewards=None,
+    buf_dones=None,
+    buf_goal=None,
+    buf_terminateds=None,
+    fps=5,
+    iteration=0,
+    save_dir=None,
+    wandb=None,
+    substep_frames=None,
+    grid_cols=None,
+):
+    """
+    Log a single grid video tiling all parallel environments.
+
+    Arranges each environment's ego-camera view into a rows x cols grid,
+    producing one combined video per iteration.  For example, 4 servers
+    x 4 agents → 16 envs → 4 x 4 grid.
+
+    Parameters are identical to ``log_ego_video`` with the addition of:
+
+    grid_cols : int or None
+        Number of columns in the grid.  When *None*, defaults to
+        ``ceil(sqrt(num_envs))`` for a roughly square layout.
+    """
+    try:
+        import imageio  # noqa: F401
+    except ImportError:
+        print("  [video] imageio not found; "
+              "run: pip install imageio imageio-ffmpeg")
+        return
+
+    import tempfile
+
+    num_steps, num_envs = buf_obs.shape[:2]
+
+    if grid_cols is None:
+        grid_cols = math.ceil(math.sqrt(num_envs))
+    grid_rows = math.ceil(num_envs / grid_cols)
+
+    # ── build per-env annotated frame sequences ───────────────────────
+    env_frames = []          # list of (T, H, W, 3) uint8 arrays
+    video_fps = fps          # will be updated if substep frames present
+
+    for env_idx in range(num_envs):
+        has_substeps = (
+            substep_frames is not None
+            and len(substep_frames[env_idx]) == num_steps
+        )
+
+        if has_substeps:
+            all_frames = np.concatenate(substep_frames[env_idx], axis=0)
+            n_skips = substep_frames[env_idx][0].shape[0]
+            video_fps = fps * n_skips
+
+            T_total = all_frames.shape[0]
+            expanded_rewards = None
+            expanded_dones = None
+            expanded_goals = None
+            expanded_terminateds = None
+
+            if buf_rewards is not None:
+                expanded_rewards = np.zeros(T_total, dtype=np.float32)
+                for s in range(num_steps):
+                    expanded_rewards[s * n_skips + n_skips - 1] = buf_rewards[s, env_idx]
+
+            if buf_dones is not None:
+                expanded_dones = np.zeros(T_total, dtype=np.float32)
+                for s in range(num_steps):
+                    expanded_dones[s * n_skips + n_skips - 1] = buf_dones[s, env_idx]
+
+            if buf_terminateds is not None:
+                expanded_terminateds = np.zeros(T_total, dtype=np.float32)
+                for s in range(num_steps):
+                    expanded_terminateds[s * n_skips + n_skips - 1] = buf_terminateds[s, env_idx]
+
+            if buf_goal is not None:
+                expanded_goals = np.repeat(
+                    buf_goal[:, env_idx], n_skips, axis=0
+                )
+
+            frames = _annotate_ego_frames(
+                all_frames,
+                rewards=expanded_rewards,
+                dones=expanded_dones,
+                goals=expanded_goals,
+                terminateds=expanded_terminateds,
+            )
+        else:
+            raw = buf_obs[:, env_idx, -1]
+            frames = _annotate_ego_frames(
+                raw,
+                rewards=buf_rewards[:, env_idx] if buf_rewards is not None else None,
+                dones=buf_dones[:, env_idx]   if buf_dones   is not None else None,
+                goals=buf_goal[:, env_idx]    if buf_goal    is not None else None,
+                terminateds=buf_terminateds[:, env_idx] if buf_terminateds is not None else None,
+            )
+
+        env_frames.append(frames)
+
+    # ── tile into grid ────────────────────────────────────────────────
+    # Different envs may have different frame counts (substep vs policy-step
+    # fallback).  Truncate to the minimum T so the grid dimensions match.
+    T = min(f.shape[0] for f in env_frames)
+    env_frames = [f[:T] for f in env_frames]
+    H, W = env_frames[0].shape[1], env_frames[0].shape[2]
+
+    # pad the list with black frames if num_envs doesn't fill the grid
+    black = np.zeros((T, H, W, 3), dtype=np.uint8)
+    while len(env_frames) < grid_rows * grid_cols:
+        env_frames.append(black)
+
+    # assemble: (grid_rows, grid_cols, T, H, W, 3) → (T, grid_rows*H, grid_cols*W, 3)
+    rows = []
+    for r in range(grid_rows):
+        row = np.concatenate(
+            env_frames[r * grid_cols : (r + 1) * grid_cols], axis=2   # concat along W
+        )
+        rows.append(row)
+    grid_video = np.concatenate(rows, axis=1)  # concat along H
+
+    # ── write to disk ─────────────────────────────────────────────────
+    stem = f"ego_grid_{iteration:04d}"
+    if save_dir is not None:
+        os.makedirs(save_dir, exist_ok=True)
+        base = os.path.join(save_dir, stem)
+        path = _write_video(grid_video, base, video_fps)
+    else:
+        tmp_dir = tempfile.mkdtemp()
+        path = _write_video(grid_video, os.path.join(tmp_dir, stem), video_fps)
+
+    if path is None:
+        return
+
+    print(f"  → ego grid video ({grid_rows}×{grid_cols}) saved to {path}")
+
+    if wandb is not None:
+        wandb.log(
+            {"rollout/ego_video_grid": wandb.Video(path, fps=video_fps)},
+            step=iteration,
+        )
+
+
+def log_ego_video(
+    buf_obs,
+    buf_rewards=None,
+    buf_dones=None,
+    buf_goal=None,
+    fps=5,
+    iteration=0,
+    save_dir=None,
+    wandb=None,
+    substep_frames=None,
+):
+    """
+    Log a video of the ego camera view for every parallel environment.
+
+    Parameters
+    ----------
+    buf_obs     : (num_steps, num_envs, context_size, H, W, 3)  uint8
+                  The most-recent frame used per step is buf_obs[:, e, -1].
+    buf_rewards : (num_steps, num_envs)  optional - shown as text overlay.
+    buf_dones   : (num_steps, num_envs)  optional - triggers red-tint flash.
+    buf_goal    : (num_steps, num_envs, 2) optional - goal (dx, dz) in
+                  standard coords, used to draw the goal compass.
+    fps         : playback frame rate (should match policy step rate).
+    save_dir    : directory to write video files; None → temp dir for W&B.
+    wandb       : wandb module (or None).
+    substep_frames : list[list[ndarray]] or None
+                  Per-env list of per-step substep frame arrays.
+                  substep_frames[env_idx][step] has shape (n_skips, H, W, 3).
+                  When provided, all substep frames are included in the video
+                  for smoother playback. Annotations (reward, done, goal) are
+                  shown only on the last substep frame of each policy step.
+    """
+    try:
+        import imageio  # noqa: F401
+    except ImportError:
+        print("  [video] imageio not found; "
+              "run: pip install imageio imageio-ffmpeg")
+        return
+
+    import tempfile
+
+    num_steps, num_envs = buf_obs.shape[:2]
+
+    for env_idx in range(num_envs):
+        # ── build frame sequence ──────────────────────────────────────
+        has_substeps = (
+            substep_frames is not None
+            and len(substep_frames[env_idx]) == num_steps
+        )
+
+        if has_substeps:
+            # Concatenate all substep frames: (num_steps * n_skips, H, W, 3)
+            all_frames = np.concatenate(substep_frames[env_idx], axis=0)
+            n_skips = substep_frames[env_idx][0].shape[0]
+            video_fps = fps * n_skips
+
+            # Expand annotations: repeat per-step values across substep frames,
+            # but only mark reward/done on the last substep of each policy step.
+            T_total = all_frames.shape[0]
+            print(f'total # of frames: {T_total} (fps: {video_fps} / n_skips: {n_skips})')
+            expanded_rewards = None
+            expanded_dones = None
+            expanded_goals = None
+
+            if buf_rewards is not None:
+                expanded_rewards = np.zeros(T_total, dtype=np.float32)
+                for s in range(num_steps):
+                    # Show reward only on the last substep frame
+                    expanded_rewards[s * n_skips + n_skips - 1] = buf_rewards[s, env_idx]
+
+            if buf_dones is not None:
+                expanded_dones = np.zeros(T_total, dtype=np.float32)
+                for s in range(num_steps):
+                    # Show done only on the last substep frame
+                    expanded_dones[s * n_skips + n_skips - 1] = buf_dones[s, env_idx]
+
+            if buf_goal is not None:
+                # Repeat goal for all substep frames within each step
+                expanded_goals = np.repeat(
+                    buf_goal[:, env_idx], n_skips, axis=0
+                )
+
+            frames = _annotate_ego_frames(
+                all_frames,
+                rewards=expanded_rewards,
+                dones=expanded_dones,
+                goals=expanded_goals,
+            )
+        else:
+            raw = buf_obs[:, env_idx, -1]  # (T, H, W, 3) – latest frame
+            video_fps = fps
+            frames = _annotate_ego_frames(
+                raw,
+                rewards=buf_rewards[:, env_idx] if buf_rewards is not None else None,
+                dones=buf_dones[:, env_idx]   if buf_dones   is not None else None,
+                goals=buf_goal[:, env_idx]    if buf_goal    is not None else None,
+            )
+
+        # ── determine output path ──────────────────────────────────────
+        stem = f"ego_env{env_idx}_{iteration:04d}"
+        if save_dir is not None:
+            os.makedirs(save_dir, exist_ok=True)
+            base = os.path.join(save_dir, stem)
+            path = _write_video(frames, base, video_fps)
+        else:
+            # write to a temp file so wandb.Video can read it
+            tmp_dir = tempfile.mkdtemp()
+            path = _write_video(frames, os.path.join(tmp_dir, stem), video_fps)
+
+        if path is None:
+            continue
+
+        print(f"  -> ego video saved to {path}")
+
+        if wandb is not None:
+            wandb.log(
+                {f"rollout/ego_video_env{env_idx}": wandb.Video(path, fps=video_fps)},
+                step=iteration,
+            )
+
+
+# ─── DINOv2 PCA Feature Visualization ────────────────────────────────
+
+
+def _extract_patch_tokens(obs_encoder, frames_uint8, no_pos_embed=False):
+    """
+    Run the DINOv2 backbone on uint8 frames and return spatial patch tokens.
+
+    Parameters
+    ----------
+    obs_encoder : ObservationEncoder
+    frames_uint8 : (N, H, W, 3) uint8 ndarray
+    no_pos_embed : bool
+        If True, temporarily zero out positional embeddings so the resulting
+        features reflect only semantic content without spatial position bias.
+
+    Returns
+    -------
+    patch_tokens : (N, C, Hp, Wp) float32 tensor  (CPU)
+    """
+    import torch
+    import torchvision.transforms.functional as TF
+    from rl.models.encoder import process_frames
+
+    device = next(obs_encoder.parameters()).device
+
+    # process_frames expects (B, N_ctx, H, W, C) or (B, H, W, C)
+    imgs = torch.from_numpy(frames_uint8).to(device)       # (N, H, W, 3)
+    imgs = process_frames(imgs)                             # (N, 3, 360, 640)
+
+    if obs_encoder.do_rgb_normalize:
+        imgs = (imgs - obs_encoder.mean) / obs_encoder.std
+    if obs_encoder.do_resize:
+        imgs = TF.center_crop(imgs, obs_encoder.crop)
+        imgs = TF.resize(imgs, obs_encoder.resize)
+
+    backbone = obs_encoder.obs_encoder
+
+    with torch.no_grad():
+        if no_pos_embed and hasattr(backbone, "pos_embed"):
+            saved_pos_embed = backbone.pos_embed.data.clone()
+            backbone.pos_embed.data.zero_()
+
+        try:
+            feats = backbone.get_intermediate_layers(
+                imgs, n=1, reshape=True,
+            )
+            patch_tokens = feats[0]                         # (N, C, Hp, Wp)
+        finally:
+            if no_pos_embed and hasattr(backbone, "pos_embed"):
+                backbone.pos_embed.data.copy_(saved_pos_embed)
+
+    return patch_tokens.float().cpu()
+
+
+def _pca_visualize_patches(patch_tokens, pca_model=None, skip_components=0):
+    """
+    Project patch tokens to RGB via PCA.
+
+    Parameters
+    ----------
+    patch_tokens : (N, C, Hp, Wp) float tensor
+    pca_model    : fitted sklearn PCA, or None to fit on the given tokens
+    skip_components : int
+        Number of leading PCA components to skip before taking 3 for RGB.
+        E.g. skip_components=1 fits (1+3)=4 components and uses the last 3,
+        discarding the first (position-dominated) component.
+
+    Returns
+    -------
+    vis_images : list of (Hp, Wp, 3) uint8 ndarrays
+    pca_model  : the (possibly newly fitted) PCA object
+    """
+    from sklearn.decomposition import PCA
+
+    n_total = 3 + skip_components
+
+    N, C, Hp, Wp = patch_tokens.shape
+    # Flatten all patches across all images for shared PCA
+    all_feats = patch_tokens.permute(0, 2, 3, 1).reshape(-1, C).numpy()  # (N*Hp*Wp, C)
+
+    if pca_model is None:
+        pca_model = PCA(n_components=n_total)
+        pca_model.fit(all_feats)
+
+    projected = pca_model.transform(all_feats)  # (N*Hp*Wp, n_total)
+    projected = projected[:, skip_components:]   # (N*Hp*Wp, 3)
+
+    # Normalize to [0, 255] using robust percentile-based scaling
+    for i in range(3):
+        ch = projected[:, i]
+        lo, hi = np.percentile(ch, [1, 99])
+        if hi - lo > 1e-6:
+            projected[:, i] = np.clip((ch - lo) / (hi - lo), 0.0, 1.0) * 255.0
+        else:
+            # Degenerate channel: map to mid-gray instead of black
+            projected[:, i] = 128.0
+
+    projected = projected.reshape(N, Hp, Wp, 3).astype(np.uint8)
+    return [projected[i] for i in range(N)], pca_model
+
+
+def log_dino_pca_video_grid(
+    obs_encoder, buf_obs,
+    fps=5,
+    iteration=0,
+    save_dir=None,
+    wandb=None,
+    grid_cols=None,
+    pca_batch_size=32,
+    substep_frames=None,
+    upsample_scale=1.0,
+    interpolation="LANCZOS",
+    no_pos_embed=False,
+    skip_components=3,
+):
+    """
+    Render a grid video of DINOv2 PCA feature maps, one cell per environment,
+    mirroring the layout of ``log_ego_video_grid``.
+
+    A shared PCA is fitted once on a subsample of patches from all envs/steps,
+    then every frame is projected with the same components so colours are
+    consistent across the whole video.
+
+    Parameters
+    ----------
+    obs_encoder    : ObservationEncoder
+    buf_obs        : (num_steps, num_envs, context_size, H, W, 3) uint8
+    fps            : playback frame rate
+    grid_cols      : columns in the tiled grid (None → ceil(sqrt(num_envs)))
+    pca_batch_size : max frames fed through DINOv2 in one forward pass
+    substep_frames : list[list[ndarray]] or None
+                     Per-env list of per-step substep frame arrays.
+                     substep_frames[env_idx][step] has shape (n_skips, H, W, 3).
+                     When provided, all substep frames are visualised for
+                     smoother playback (matching the RGB ego video).
+    upsample_scale : float
+                     Scale factor relative to the original image resolution.
+                     1.0 = original size, 2.0 = double resolution, etc.
+    interpolation  : str
+                     PIL resampling filter name: "NEAREST", "BILINEAR",
+                     "BICUBIC", or "LANCZOS".  Default "LANCZOS" gives
+                     the smoothest output.
+    """
+    try:
+        import imageio  # noqa: F401
+    except ImportError:
+        print("  [dino-pca] imageio not found; "
+              "run: pip install imageio imageio-ffmpeg")
+        return
+
+    import tempfile
+    from PIL import Image as PILImage
+    from sklearn.decomposition import PCA
+
+    resample_filter = getattr(PILImage, interpolation.upper(), PILImage.LANCZOS)
+
+    num_steps, num_envs = buf_obs.shape[:2]
+    H_img, W_img = buf_obs.shape[3], buf_obs.shape[4]  # original RGB size
+    H_out = int(H_img * upsample_scale)
+    W_out = int(W_img * upsample_scale)
+
+    if grid_cols is None:
+        grid_cols = math.ceil(math.sqrt(num_envs))
+    grid_rows = math.ceil(num_envs / grid_cols)
+
+    # ── 0. Build per-env frame sequences (handle substep frames) ──────
+    # For each env, produce (T_env, H, W, 3) uint8 frames to feed DINOv2.
+    video_fps = fps
+    env_all_frames = []  # list of (T_env, H, W, 3) uint8
+
+    for e in range(num_envs):
+        has_substeps = (
+            substep_frames is not None
+            and len(substep_frames[e]) == num_steps
+        )
+        if has_substeps:
+            all_f = np.concatenate(substep_frames[e], axis=0)  # (T*n_skips, H, W, 3)
+            n_skips = substep_frames[e][0].shape[0]
+            video_fps = fps * n_skips
+            env_all_frames.append(all_f)
+        else:
+            env_all_frames.append(buf_obs[:, e, -1])  # (T, H, W, 3)
+
+    # ── 1. Fit shared PCA on a subsample of frames ────────────────────
+    T_total = env_all_frames[0].shape[0]
+    n_fit = min(T_total, 16)
+    fit_step_indices = np.linspace(0, T_total - 1, n_fit, dtype=int)
+    fit_frames = []
+    for t in fit_step_indices:
+        for e in range(num_envs):
+            fit_frames.append(env_all_frames[e][t])
+    fit_frames = np.stack(fit_frames)  # (n_fit * num_envs, H, W, 3)
+
+    # Extract patch tokens in batches
+    fit_tokens_list = []
+    for i in range(0, len(fit_frames), pca_batch_size):
+        batch = fit_frames[i : i + pca_batch_size]
+        fit_tokens_list.append(_extract_patch_tokens(obs_encoder, batch, no_pos_embed=no_pos_embed))
+    import torch
+    fit_tokens = torch.cat(fit_tokens_list, dim=0)  # (n_fit*num_envs, C, Hp, Wp)
+
+    N_fit, C, Hp, Wp = fit_tokens.shape
+    fit_feats = fit_tokens.permute(0, 2, 3, 1).reshape(-1, C).numpy()
+
+    pca = PCA(n_components=3 + skip_components)
+    pca.fit(fit_feats)
+
+    # ── 2. Project every frame for every env through the shared PCA ───
+    env_pca_frames = []  # list of (T_env, H_out, W_out, 3) uint8 per env
+    for e in range(num_envs):
+        env_rgb = env_all_frames[e]  # (T_env, H, W, 3) uint8
+
+        # Extract patch tokens in batches
+        tokens_list = []
+        for i in range(0, len(env_rgb), pca_batch_size):
+            batch = env_rgb[i : i + pca_batch_size]
+            tokens_list.append(_extract_patch_tokens(obs_encoder, batch, no_pos_embed=no_pos_embed))
+        tokens = torch.cat(tokens_list, dim=0)  # (T_env, C, Hp, Wp)
+
+        vis_list, _ = _pca_visualize_patches(tokens, pca_model=pca, skip_components=skip_components)
+
+        # Upsample each PCA frame to target resolution
+        upsampled = np.stack([
+            np.array(PILImage.fromarray(v).resize(
+                (W_out, H_out), resample_filter,
+            ))
+            for v in vis_list
+        ])  # (T_env, H_out, W_out, 3)
+
+        env_pca_frames.append(upsampled)
+
+    # ── 3. Tile into grid (same as log_ego_video_grid) ────────────────
+    T = env_pca_frames[0].shape[0]
+    black = np.zeros((T, H_out, W_out, 3), dtype=np.uint8)
+    while len(env_pca_frames) < grid_rows * grid_cols:
+        env_pca_frames.append(black)
+
+    rows = []
+    for r in range(grid_rows):
+        row = np.concatenate(
+            env_pca_frames[r * grid_cols : (r + 1) * grid_cols], axis=2,
+        )
+        rows.append(row)
+    grid_video = np.concatenate(rows, axis=1)
+
+    # ── 4. Write to disk ──────────────────────────────────────────────
+    stem = f"dino_pca_grid_{iteration:04d}"
+    if save_dir is not None:
+        os.makedirs(save_dir, exist_ok=True)
+        base = os.path.join(save_dir, stem)
+        path = _write_video(grid_video, base, video_fps)
+    else:
+        tmp_dir = tempfile.mkdtemp()
+        path = _write_video(grid_video, os.path.join(tmp_dir, stem), video_fps)
+
+    if path is None:
+        return
+
+    print(f"  → DINOv2 PCA grid video ({grid_rows}×{grid_cols}, "
+          f"{H_out}×{W_out}) saved to {path}")
+
+    if wandb is not None:
+        wandb.log(
+            {"rollout/dino_pca_video": wandb.Video(path, fps=video_fps)},
+            step=iteration,
+        )
+
+
+# ─── Weather Distribution Tracking ───────────────────────────────────
+
+# Parameter display metadata: (label, sampling range min, sampling range max)
+_WEATHER_PARAMS = [
+    ("cloudiness",              0,  90),
+    ("precipitation",           0,  80),
+    ("precipitation_deposits",  0,  80),
+    ("wind_intensity",          0, 100),
+    ("sun_azimuth_angle",       0, 360),
+    ("sun_altitude_angle",    -15,  90),
+    ("fog_density",             0,  40),
+    ("fog_distance",            0, 100),
+    ("wetness",                 0,  80),
+]
+
+
+class WeatherTracker:
+    """Accumulates per-reset weather parameter samples for distribution logging.
+
+    Call ``update(infos)`` after each env step.  The tracker records one sample
+    per environment whenever the weather dict in the info changes (i.e. on full
+    environment resets).  Duplicate consecutive weather settings from the same
+    environment are ignored.
+    """
+
+    def __init__(self, num_envs: int):
+        self.num_envs = num_envs
+        # {param_name: list[float]} — accumulated samples across all envs/resets
+        self.samples = {name: [] for name, _, _ in _WEATHER_PARAMS}
+        # per-env last-seen weather to detect changes
+        self._last = [None] * num_envs
+
+    def update(self, infos):
+        """Extract weather from info dicts; record new samples on change."""
+        for i, info in enumerate(infos):
+            w = info.get("weather")
+            if w is None:
+                continue
+            if w != self._last[i]:
+                self._last[i] = w
+                for name, _, _ in _WEATHER_PARAMS:
+                    self.samples[name].append(w[name])
+
+    @property
+    def num_samples(self) -> int:
+        first_key = _WEATHER_PARAMS[0][0]
+        return len(self.samples[first_key])
+
+
+def log_weather_distributions(
+    tracker,
+    iteration=0,
+    save_dir=None,
+    wandb=None,
+):
+    """Plot 3x3 histogram grid of accumulated weather parameter distributions.
+
+    Saves to ``<save_dir>/weather_dist_<iteration>.png`` (removing older
+    snapshots) and logs to W&B as ``rollout/weather_distributions``.
+    Also logs per-parameter scalar statistics to W&B.
+    """
+    n = tracker.num_samples
+    if n == 0:
+        return
+
+    fig, axes = plt.subplots(3, 3, figsize=(12, 9))
+    fig.suptitle(f"Weather distributions  (n={n}, iter {iteration})", fontsize=13)
+    axes = axes.ravel()
+
+    for ax, (name, lo, hi) in zip(axes, _WEATHER_PARAMS):
+        vals = np.array(tracker.samples[name])
+        nbins = min(30, max(5, n // 3))
+        ax.hist(vals, bins=nbins, range=(lo, hi), color="#5b9bd5",
+                edgecolor="white", linewidth=0.4)
+        ax.set_xlim(lo, hi)
+        ax.set_title(name.replace("_", " "), fontsize=10)
+        ax.tick_params(labelsize=8)
+        mu, sigma = vals.mean(), vals.std()
+        ax.text(0.97, 0.93, f"$\\mu$={mu:.1f}  $\\sigma$={sigma:.1f}",
+                transform=ax.transAxes, ha="right", va="top", fontsize=8,
+                bbox=dict(boxstyle="round,pad=0.2", fc="white", alpha=0.7))
+
+    fig.tight_layout(rect=[0, 0, 1, 0.95])
+
+    if save_dir is not None:
+        os.makedirs(save_dir, exist_ok=True)
+        # remove previous snapshots
+        import glob as _glob
+        for old in _glob.glob(os.path.join(save_dir, "weather_dist_*.png")):
+            try:
+                os.remove(old)
+            except OSError:
+                pass
+        path = os.path.join(save_dir, f"weather_dist_{iteration:04d}.png")
+        fig.savefig(path, dpi=120)
+        print(f"  → Weather distribution figure saved to {path}")
+
+    if wandb is not None:
+        wandb.log({"rollout/weather_distributions": wandb.Image(fig)},
+                  step=iteration)
+        # scalar statistics per parameter
+        for name, _, _ in _WEATHER_PARAMS:
+            vals = np.array(tracker.samples[name])
+            wandb.log({
+                f"weather/{name}_mean": vals.mean(),
+                f"weather/{name}_std": vals.std(),
+            }, step=iteration)
+
+    plt.close(fig)
+

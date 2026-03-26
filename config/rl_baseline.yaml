@@ -1,0 +1,46 @@
+project:
+  name: 'ppo_baseline'
+  run_name: 'carla'
+  result_dir: 'res0223'
+
+model:
+  type: 'flow_matching'
+  do_rgb_normalize: true
+  do_resize: true
+  obs_encoder:
+    type: 'dinov2_vitb14'
+    context_size: 5
+    crop: [350, 630]
+    resize: [350, 630]
+    freeze: true
+  output_coordinate_repr: 'euclidean'
+
+  cord_embedding:
+    type: 'input_target'
+    num_freqs: 6
+    include_input: true
+
+  encoder_feat_dim: 768
+
+  decoder:
+    type: 'flow_matching'
+    len_traj_pred: 5
+    num_heads: 8
+    num_layers: 16
+    ff_dim_factor: 4
+    num_diffusion_iters: 100
+
+data:
+  type: carla
+  pose_fps: 2
+  video_fps: 2
+  target_fps: 1
+  width: 640
+  height: 480
+  fov: 110.0
+  desired_width: 640
+  desired_height: 360
+
+logging:
+  enable_wandb: true
+

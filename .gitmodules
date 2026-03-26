@@ -1,0 +1,3 @@
+[submodule "thirdparty/DPVO"]
+	path = thirdparty/DPVO
+	url = https://github.com/ai4ce/DPVO.git

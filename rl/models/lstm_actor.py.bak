@@ -1,0 +1,50 @@
+
+import torch
+import torch.nn as nn
+
+from rl.models.encoder import ObservationEncoder
+
+class LSTMActor(nn.Module):
+    def __init__(self, cfg, hidden_dim, num_layers, output_dim):
+        super().__init__()
+
+        obs_feature_dim = cfg.model.encoder_feat_dim
+        self.obs_encoder = ObservationEncoder(cfg)
+        # observation features + goal/target features
+        self.lstm = nn.LSTM(obs_feature_dim+2, hidden_dim, num_layers, batch_first=True)
+        
+        # final summary -> trajectory seed
+        # TODO: scale
+        self.mu_head = nn.Linear(hidden_dim, output_dim)
+        self.log_std_head = nn.Linear(hidden_dim, output_dim)        
+        self.output_dim = output_dim
+
+    def forward(self, obs, cord):
+
+        features = self.obs_encoder(obs, cord)        
+        # LSTM memory
+        # tensor of shape (B, N, hidden dim)
+        lstm_out, _ = self.lstm(features)
+        
+        # last temporal output
+        last_h = lstm_out[:, -1, :] 
+        
+        # action distribution: seed for flow matching
+        mu = self.mu_head(last_h).view(-1, self.output_dim)
+        log_std = self.log_std_head(last_h).view(-1, self.output_dim)
+        log_std = torch.clamp(log_std, -20, 2)
+        return mu, log_std
+    
+    def get_action(self, obs_tokens, target_token):
+        """
+        reparametrization trick
+        """
+        mu, log_std = self.forward(obs_tokens, target_token)
+        std = log_std.exp()
+        dist = torch.distributions.Normal(mu, std)
+        x_init = dist.rsample() # sample with gradients for SAC
+        
+        # log prob. for SAC update
+        log_prob = dist.log_prob(x_init).sum(dim=(1, 2))
+        return x_init, log_prob
+

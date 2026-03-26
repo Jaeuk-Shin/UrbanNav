@@ -1,0 +1,188 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <title>Geolocation Tracker</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 20px;
+        }
+
+        button {
+            margin-right: 10px;
+            padding: 10px 20px;
+            font-size: 16px;
+        }
+
+        #status {
+            margin-top: 20px;
+            font-weight: bold;
+        }
+
+        pre {
+            background-color: #f4f4f4;
+            padding: 15px;
+            border-radius: 5px;
+            overflow: auto;
+        }
+    </style>
+</head>
+
+<body>
+    <h1>Geolocation Tracker</h1>
+    <button onclick="startTracking()">Start</button>
+    <button onclick="stopTracking()">Stop</button>
+    <button id="enableOrientation">Enable Compass</button>
+    <div id="status">Status: Stopped</div>
+    <pre id="data">Awaiting data...</pre>
+
+    <script>
+        let tracking = false;
+        let watchId = null;
+        let currentHeading = null;
+
+        // Start Geolocation Tracking
+        function startTracking() {
+            if (tracking) return;
+            tracking = true;
+            document.getElementById('status').innerText = 'Status: Tracking...';
+
+            if (navigator.geolocation) {
+                watchId = navigator.geolocation.watchPosition(
+                    successCallback,
+                    errorCallback,
+                    {
+                        enableHighAccuracy: true,
+                        maximumAge: 0,
+                        timeout: 10000 // Adjust timeout as needed
+                    }
+                );
+            } else {
+                alert('Geolocation is not supported by this browser.');
+            }
+        }
+
+        // Stop Geolocation Tracking
+        function stopTracking() {
+            if (!tracking) return;
+            tracking = false;
+            document.getElementById('status').innerText = 'Status: Stopped';
+            if (watchId !== null) {
+                navigator.geolocation.clearWatch(watchId);
+                watchId = null;
+            }
+        }
+
+        // Geolocation Success Callback
+        function successCallback(position) {
+            const data = {
+                timestamp: new Date().toISOString(),
+                latitude: position.coords.latitude,
+                longitude: position.coords.longitude,
+                accuracy: position.coords.accuracy,
+                altitude: position.coords.altitude,
+                altitudeAccuracy: position.coords.altitudeAccuracy,
+                heading: currentHeading, // Use heading from Device Orientation
+                speed: position.coords.speed
+            };
+
+            displayData(data);
+            sendDataToServer(data);
+        }
+
+        // Geolocation Error Callback
+        function errorCallback(error) {
+            console.error('Geolocation error:', error);
+            alert('Geolocation error: ' + error.message);
+        }
+
+        // Display Data on the Page
+        function displayData(data) {
+            const dataElement = document.getElementById('data');
+            dataElement.innerText = JSON.stringify(data, null, 2);
+        }
+
+        // Send Data to the Server
+        function sendDataToServer(data) {
+            fetch('/location', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify(data)
+            })
+                .then(response => {
+                    if (!response.ok) {
+                        throw new Error('Network response was not ok');
+                    }
+                    // Optionally handle server response
+                })
+                .catch(error => {
+                    console.error('Error sending data:', error);
+                });
+        }
+
+        // Handle Device Orientation
+        document.getElementById('enableOrientation').addEventListener('click', function () {
+            if (typeof DeviceOrientationEvent.requestPermission === 'function') {
+                // iOS 13+ devices
+                DeviceOrientationEvent.requestPermission()
+                    .then(permissionState => {
+                        if (permissionState === 'granted') {
+                            window.addEventListener('deviceorientation', handleOrientation);
+                            console.log('Device Orientation permission granted.');
+                            alert('Compass enabled.');
+                        } else {
+                            alert('Permission to access device orientation was denied.');
+                        }
+                    })
+                    .catch(error => {
+                        console.error('Error requesting Device Orientation permission:', error);
+                    });
+            } else {
+                // Non iOS 13+ devices
+                window.addEventListener('deviceorientation', handleOrientation);
+                console.log('Device Orientation listener added.');
+                alert('Compass enabled.');
+            }
+        });
+
+        // Device Orientation Callback
+        function handleOrientation(event) {
+            let alpha = event.alpha;
+
+            if (alpha !== null) {
+                // Some browsers return alpha relative to the device's starting orientation
+                // You may need to adjust based on your specific needs
+                currentHeading = alpha.toFixed(2); // Round to two decimal places
+                updateHeadingInDisplay(currentHeading);
+            }
+        }
+
+        // Update Heading in Display
+        function updateHeadingInDisplay(heading) {
+            const dataElement = document.getElementById('data');
+            let data = {};
+
+            try {
+                data = JSON.parse(dataElement.innerText);
+            } catch (e) {
+                console.error('Error parsing data display:', e);
+            }
+
+            data.heading = heading;
+            dataElement.innerText = JSON.stringify(data, null, 2);
+        }
+
+        // Optional: Automatically enable compass on page load
+        // Uncomment the following lines if you want to prompt the user immediately
+        /*
+        window.addEventListener('load', () => {
+            document.getElementById('enableOrientation').click();
+        });
+        */
+    </script>
+</body>
+
+</html>

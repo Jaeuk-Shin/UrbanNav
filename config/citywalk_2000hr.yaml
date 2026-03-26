@@ -1,0 +1,74 @@
+project:
+  name: 'CityWalker'
+  run_name: 'train_2000hr'
+  result_dir: 'results'
+
+training:
+  batch_size: 32
+  max_epochs: 10
+  gpus: 1
+  amp: false
+  normalize_step_length: true
+  resume: false
+  direction_loss_weight: 5.0
+  feature_loss_weight: 0.1
+
+scheduler:
+  name: 'cosine'
+  step_size: 10
+  gamma: 0.1
+
+optimizer:
+  name: 'adamw'
+  lr: 2e-4
+
+model:
+  type: 'citywalker_feat'
+  do_rgb_normalize: true
+  do_resize: true
+  obs_encoder:
+    type: 'dinov2_vitb14'
+    context_size: 5
+    crop: [350, 630]
+    resize: [350, 630]
+    freeze: true
+  output_coordinate_repr: 'euclidean'
+
+  cord_embedding:
+    type: 'input_target'
+    num_freqs: 6
+    include_input: true
+
+  encoder_feat_dim: 768
+
+  decoder:
+    type: 'attention'
+    len_traj_pred: 5
+    num_heads: 8
+    num_layers: 16
+    ff_dim_factor: 4
+
+data:
+  type: citywalk_feat
+  video_dir: 'dataset/citywalk_2min/videos'
+  pose_dir: 'dataset/citywalk_2min/poses'
+  num_workers: 23
+  pose_fps: 5
+  video_fps: 30
+  target_fps: 1
+  num_train: 50000
+  num_val: 1000
+  num_test: 0
+  input_noise: 0.1 # sigma (after normalization)
+  search_window: 50 # frames
+  arrived_threshold: 5 # num frame
+  arrived_prob: 0.3
+
+validation:
+  num_visualize: 400
+testing:
+  num_visualize: 400
+
+logging:
+  enable_wandb: true  # Set to false to disable Wandb logging
+  pbar_rate: 100

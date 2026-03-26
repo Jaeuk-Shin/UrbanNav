@@ -1,0 +1,28 @@
+name: urban-nav
+channels:
+  - nvidia
+  - pytorch
+  - xformers
+  - conda-forge
+dependencies:
+  - python=3.12
+  - pip                 
+  - pip:
+      - --extra-index-url https://download.pytorch.org/whl/cu127
+      - xformers
+      - torch
+      - torchvision
+      - PyYAML
+      - numpy
+      - matplotlib
+      - scipy
+      - pytorch-lightning
+      - wandb
+      - decord
+      - casadi
+      - diffusers[torch]
+      - einops
+      - ray[rllib]
+      - opencv-python
+      - hydra-core
+      - omegaconf

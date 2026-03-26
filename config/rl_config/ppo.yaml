@@ -1,0 +1,13 @@
+framework: "torch"
+num_gpus: 1
+num_cpus_per_env_runner: 1
+num_env_runners: 1
+num_gpus_per_env_runner: 1
+lr: 0.00005
+model_config:
+  lstm_config:
+    hidden_dim: 256
+    num_layers: 1
+    encoder_feat_dim: 384
+    max_seq_len: 20
+train_batch_size: 4000
