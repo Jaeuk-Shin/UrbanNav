@@ -68,9 +68,17 @@ data:
       # pose_subdir: pose  # default
       # feature_subdir: dino  # default
       # camera:             # per-dataset camera intrinsics (optional)
+      #   --- FOV-based (CARLA-style) ---
       #   width: 640
       #   height: 480
       #   fov: 110.0
+      #   desired_width: 640
+      #   desired_height: 360
+      #   --- OR explicit intrinsics ---
+      #   fx: 410
+      #   fy: 410
+      #   cx: 320
+      #   cy: 180
       #   desired_width: 640
       #   desired_height: 360
     - root: '/path/to/dataset_b'

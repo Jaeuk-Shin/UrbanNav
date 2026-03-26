@@ -131,19 +131,12 @@ class CarlaFeatDataset(Dataset):
         assert len(self.lut) > 0, "No usable samples found."
 
         # Camera intrinsics (optional — for image-overlay visualization).
-        # Accepts a nested 'camera' dict or legacy top-level data fields.
-        cam = getattr(cfg.data, 'camera', None)
-        if cam is not None:
-            self._camera = [float(cam['width']), float(cam['height']),
-                            float(cam['fov']), float(cam['desired_width']),
-                            float(cam['desired_height'])]
-        elif all(hasattr(cfg.data, k) for k in
-                 ('width', 'height', 'fov', 'desired_width', 'desired_height')):
-            d = cfg.data
-            self._camera = [float(d.width), float(d.height), float(d.fov),
-                            float(d.desired_width), float(d.desired_height)]
-        else:
-            self._camera = None
+        # Internally normalized to [fx, fy, cx, cy, desired_width, desired_height].
+        # Accepts two config styles:
+        #   Explicit:  camera: {fx, fy, cx, cy, desired_width, desired_height}
+        #   FOV-based: camera: {width, height, fov, desired_width, desired_height}
+        # Legacy top-level data fields (width/height/fov/…) are also supported.
+        self._camera = self._parse_camera_intrinsics(cfg)
 
         # Data augmentation
         self.augment = (mode == 'train')
@@ -154,6 +147,34 @@ class CarlaFeatDataset(Dataset):
 
         # Per-worker feature file cache
         self._feat_cache = {'idx': None, 'data': None}
+
+    @staticmethod
+    def _parse_camera_intrinsics(cfg):
+        """Return [fx, fy, cx, cy, dw, dh] or None."""
+
+        def _from_fov(width, height, fov, dw, dh):
+            f = 0.5 * width / np.tan(float(fov) * np.pi / 360.0)
+            return [f, f, 0.5 * width, 0.5 * height, dw, dh]
+
+        cam = getattr(cfg.data, 'camera', None)
+        if cam is not None:
+            dw = float(cam['desired_width'])
+            dh = float(cam['desired_height'])
+            if 'fx' in cam:
+                return [float(cam['fx']), float(cam['fy']),
+                        float(cam['cx']), float(cam['cy']), dw, dh]
+            else:
+                return _from_fov(float(cam['width']), float(cam['height']),
+                                 cam['fov'], dw, dh)
+
+        # Legacy top-level data fields (always FOV-based)
+        keys = ('width', 'height', 'fov', 'desired_width', 'desired_height')
+        if all(hasattr(cfg.data, k) for k in keys):
+            d = cfg.data
+            return _from_fov(float(d.width), float(d.height), d.fov,
+                             float(d.desired_width), float(d.desired_height))
+
+        return None
 
     def __len__(self):
         return len(self.lut)
@@ -270,14 +291,14 @@ class CarlaFeatDataset(Dataset):
                     image_path = os.path.join(dirpath, img_files[last_idx])
             sample['image_path'] = image_path
 
-            # Per-sample camera intrinsics for visualization.
+            # Per-sample camera intrinsics [fx, fy, cx, cy, dw, dh].
             # Sentinel -1 means "no camera" — keeps keys uniform across
             # datasets in a ConcatDataset so default collation works.
             if self._camera is not None:
                 sample['camera_intrinsics'] = torch.tensor(
                     self._camera, dtype=torch.float32)
             else:
-                sample['camera_intrinsics'] = torch.full((5,), -1.0)
+                sample['camera_intrinsics'] = torch.full((6,), -1.0)
 
         return sample
 

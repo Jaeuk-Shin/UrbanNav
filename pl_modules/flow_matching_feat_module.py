@@ -4,7 +4,7 @@ import torch
 import torch.nn.functional as F
 from omegaconf import OmegaConf
 from model.flow_matching_feat import FlowMatchingFeat
-from vis_utils import build_intrinsic_matrix, project_waypoints_onto_image_plane
+from vis_utils import project_waypoints_onto_image_plane
 from PIL import Image
 import matplotlib
 import matplotlib.pyplot as plt
@@ -184,8 +184,11 @@ class FlowMatchingFeatModule(pl.LightningModule):
             )
 
             if has_camera:
-                width, height, fov, dw, dh = cam_all[idx].tolist()
+                fx, fy, cx, cy, dw, dh = cam_all[idx].tolist()
+                # Approximate horizontal FOV for coordinate-panel overlay
+                fov = 2.0 * np.degrees(np.arctan(cx / fx)) if fx > 0 else None
             else:
+                fx = fy = cx = cy = dw = dh = 0.0
                 fov = None
 
             if has_image and has_camera:
@@ -195,7 +198,7 @@ class FlowMatchingFeatModule(pl.LightningModule):
                     ax_img, batch['image_path'][idx],
                     gt_waypoints, pred_waypoints,
                     batch['gt_waypoints_y'][idx].cpu().numpy(),
-                    width=width, height=height, fov=fov,
+                    fx=fx, fy=fy, cx=cx, cy=cy,
                     desired_width=dw, desired_height=dh,
                 )
             else:
@@ -214,7 +217,7 @@ class FlowMatchingFeatModule(pl.LightningModule):
     # -- visualisation helpers --------------------------------------------------
 
     def _draw_image_panel(self, ax, image_path, gt_waypoints, pred_waypoints,
-                          gt_waypoints_y, *, width, height, fov,
+                          gt_waypoints_y, *, fx, fy, cx, cy,
                           desired_width, desired_height):
         """Render the raw image with projected waypoint overlays."""
         img = Image.open(image_path).convert('RGB')
@@ -223,23 +226,21 @@ class FlowMatchingFeatModule(pl.LightningModule):
         dw = int(desired_width)
         dh = int(desired_height)
 
-        # Center-crop / pad to match training resolution
+        # Center-crop offset (used to shift projected coords into crop space)
+        left = max(0, (W_orig - dw) // 2)
+        top = max(0, (H_orig - dh) // 2)
+
         if W_orig != dw or H_orig != dh:
-            left = max(0, (W_orig - dw) // 2)
-            top = max(0, (H_orig - dh) // 2)
             img = img.crop((left, top, left + dw, top + dh))
 
         ax.imshow(np.array(img))
         ax.axis('off')
 
-        # Camera intrinsics & crop offset
-        K = build_intrinsic_matrix(w=int(width), h=int(height), fov=fov)
-
-        x_offset = 0.5 * (width - dw)
-        y_offset = 0.5 * (height - dh)
+        # Camera intrinsics
+        K = np.array([[fx, 0., cx], [0., fy, cy], [0., 0., 1.]])
 
         def shift(u, v):
-            return u - x_offset, v - y_offset
+            return u - left, v - top
 
         # Ground-truth waypoints
         u_gt, v_gt, valid = project_waypoints_onto_image_plane(
