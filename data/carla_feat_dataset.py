@@ -55,16 +55,48 @@ class CarlaFeatDataset(Dataset):
         else:
             raise ValueError(f"Invalid mode {mode}")
 
-        # Load corresponding feature file paths
+        # Optional keep-list filtering (produced by filter_episodes.py)
+        keep_list_path = getattr(cfg.data, 'keep_list', None)
+        if keep_list_path and os.path.exists(keep_list_path):
+            with open(keep_list_path) as f:
+                keep_names = set(line.strip() for line in f if line.strip())
+            before = len(self.pose_path)
+            self.pose_path = [
+                p for p in self.pose_path
+                if os.path.basename(p) in keep_names
+            ]
+            print(f"[{mode}] keep_list filter: {before} → {len(self.pose_path)} episodes")
+
+        # Load corresponding feature file paths.
+        # Build a lookup from normalized name (single quotes stripped) to
+        # actual filename so we can tolerate quote mismatches between pose
+        # files and precomputed feature files (common with yt-dlp downloads).
+        available_pts = {}
+        if os.path.isdir(self.feature_dir):
+            for fn in os.listdir(self.feature_dir):
+                if fn.endswith('.pt') and fn != 'metadata.pt':
+                    key = fn.replace("'", "")
+                    available_pts[key] = fn
+
         self.feature_paths = []
         for f in self.pose_path:
             name, _ = os.path.splitext(os.path.basename(f))
             feat_path = os.path.join(self.feature_dir, f'{name}.pt')
             if not os.path.exists(feat_path):
-                raise FileNotFoundError(
-                    f"Feature file {feat_path} not found. "
-                    f"Run precompute_features.py first."
-                )
+                # Try matching with quotes stripped from both sides
+                norm_key = f'{name}.pt'.replace("'", "")
+                if norm_key in available_pts:
+                    feat_path = os.path.join(
+                        self.feature_dir, available_pts[norm_key])
+                else:
+                    # Show available files for diagnosis
+                    avail = sorted(available_pts.values())[:10]
+                    raise FileNotFoundError(
+                        f"Feature file {feat_path} not found. "
+                        f"Run precompute_features.py first.\n"
+                        f"Available .pt files in {self.feature_dir} "
+                        f"(first 10): {avail}"
+                    )
             self.feature_paths.append(feat_path)
 
         # Load metadata
@@ -110,6 +142,40 @@ class CarlaFeatDataset(Dataset):
             else:
                 img_dir = os.path.join(self.data_dir, name, 'fcam')
             self.image_dirs.append(img_dir if os.path.isdir(img_dir) else None)
+
+        # Locate video files for episodes that lack a frame directory.
+        # Used for on-the-fly frame extraction during visualization via decord.
+        # Like the feature-file lookup above, we build a quote-stripped index
+        # so that yt-dlp naming mismatches (e.g. apostrophes in video titles)
+        # don't prevent matching.
+        _VIDEO_EXTS = ('.mp4', '.webm', '.mkv', '.avi', '.mov')
+        available_videos = {}
+        if rgb_dir and os.path.isdir(rgb_dir):
+            for fn in os.listdir(rgb_dir):
+                if any(fn.lower().endswith(ext) for ext in _VIDEO_EXTS):
+                    key = fn.replace("'", "")
+                    available_videos[key] = fn
+
+        self.video_paths = []
+        for i, pp in enumerate(self.pose_path):
+            video_path = None
+            if self.image_dirs[i] is None and rgb_dir:
+                name = os.path.splitext(os.path.basename(pp))[0]
+                # Direct lookup
+                for ext in _VIDEO_EXTS:
+                    candidate = os.path.join(rgb_dir, f'{name}{ext}')
+                    if os.path.exists(candidate):
+                        video_path = candidate
+                        break
+                # Quote-tolerant fallback
+                if video_path is None:
+                    for ext in _VIDEO_EXTS:
+                        norm_key = f'{name}{ext}'.replace("'", "")
+                        if norm_key in available_videos:
+                            video_path = os.path.join(
+                                rgb_dir, available_videos[norm_key])
+                            break
+            self.video_paths.append(video_path)
 
         self.step_scale = []
         for pose in self.poses:
@@ -290,6 +356,17 @@ class CarlaFeatDataset(Dataset):
                     last_idx = min(frame_indices[-1], len(img_files) - 1)
                     image_path = os.path.join(dirpath, img_files[last_idx])
             sample['image_path'] = image_path
+
+            # Video path + frame index for on-the-fly decord extraction when
+            # no pre-split frames are available.  Empty/sentinel values keep
+            # every sample's keys uniform for default collation.
+            video_path = ''
+            video_frame_idx = -1
+            if not image_path and self.video_paths[video_idx] is not None:
+                video_path = self.video_paths[video_idx]
+                video_frame_idx = int(frame_indices[-1])
+            sample['video_path'] = video_path
+            sample['video_frame_idx'] = video_frame_idx
 
             # Per-sample camera intrinsics [fx, fy, cx, cy, dw, dh].
             # Sentinel -1 means "no camera" — keeps keys uniform across

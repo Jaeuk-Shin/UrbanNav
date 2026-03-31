@@ -29,6 +29,7 @@ from rl.envs.mpc.mpc import MPC
 from rl.envs.obstacle_manager import ObstacleManager, ObstacleConfig
 from rl.envs.pedestrian_manager import PedestrianManager, PedestrianConfig
 from rl.utils.geodesic import GeodesicDistanceField
+from rl.utils.geodesic_dynamic import DynamicGeodesicField
 from rl.utils.navmesh_cache import NavmeshCache
 
 
@@ -126,6 +127,8 @@ class CarlaMultiAgentEnv:
             quadrant_margin=None,
             randomize_weather=False,
             use_mpc=False,
+            dynamic_geo_mode='off',
+            dynamic_geo_horizon=5.0,
             ):
         assert 1 <= num_agents <= 4, "Currently supports 1-4 agents (quadrants)"
 
@@ -216,6 +219,19 @@ class CarlaMultiAgentEnv:
         self._geo_grids: list = [None] * num_agents
         self._geo_dists: list = [None] * num_agents
         self._geo_paths: list = [None] * num_agents   # traced geodesic paths (std coords)
+
+        # Dynamic geodesic reward mode:
+        #   'off'       — static geodesic (default)
+        #   'soft'      — soft-cost swept-volume heuristic (per-step 2D Dijkstra)
+        #   'timespace' — exact time-space backward DP
+        _valid = ('off', 'soft', 'timespace')
+        assert dynamic_geo_mode in _valid, f"dynamic_geo_mode must be one of {_valid}"
+        self._dynamic_geo_mode = dynamic_geo_mode if pedestrian_config is not None else 'off'
+        self._dynamic_geo_horizon = dynamic_geo_horizon  # seconds
+        # Per-quadrant DynamicGeodesicField wrappers (created after geo_grids)
+        self._dgeo_fields: list = [None] * num_agents
+        # Cached 3-D value fields for timespace vis (updated each step)
+        self._dgeo_V: list = [None] * num_agents
 
         # Episode solvability tracking (cumulative across auto-resets)
         self._max_goal_retries = 5
@@ -548,6 +564,9 @@ class CarlaMultiAgentEnv:
                   f"{len(quad_tris)}/{len(all_tris)} tris")
             self._geo_grids[i] = GeodesicDistanceField(
                 quad_tris, resolution=1.0)
+            if self._dynamic_geo_mode == 'timespace':
+                self._dgeo_fields[i] = DynamicGeodesicField(
+                    self._geo_grids[i])
 
     def _update_geodesic(self, agent_idx):
         """Recompute the geodesic distance field for *agent_idx*.
@@ -1185,8 +1204,48 @@ class CarlaMultiAgentEnv:
         self._substep_frames = [[] for _ in range(N)]
 
         # ── Pre-step bookkeeping ──
-        # phi0 = [self._potential(i) for i in range(N)]          # Euclidean
-        phi0 = [self._geodesic_potential(i) for i in range(N)]   # geodesic
+        _t_pre0 = time.perf_counter()
+
+        # Cache obstacle positions early (needed by dynamic geodesic + SFM)
+        self._cached_obs_pos_ue = self.obstacle_mgr.get_obstacle_positions_ue()
+
+        # Dynamic geodesic: forward-predict pedestrian trajectories and
+        # recompute distance fields accounting for predicted pedestrians.
+        _dyn_V = None            # 3-D value field for timespace mode
+        if self._dynamic_geo_mode != 'off' and self.ped_mgr.enabled:
+            horizon_steps = max(1, int(self._dynamic_geo_horizon / self.dt))
+            ped_traj_std = self.ped_mgr.predict_trajectories_std(
+                horizon_steps, self.dt, self._cached_obs_pos_ue)
+
+            if self._dynamic_geo_mode == 'soft':
+                for i in range(N):
+                    geo = self._geo_grids[i]
+                    if geo is not None and geo._static_walkable is not None:
+                        self._geo_dists[i] = geo.compute_distance_field_dynamic(
+                            self.goal_globals[i], ped_traj_std)
+            elif self._dynamic_geo_mode == 'timespace':
+                # Compute 3-D value field V[t, r, c] per agent
+                _dyn_V = [None] * N
+                for i in range(N):
+                    dgeo = self._dgeo_fields[i]
+                    if dgeo is not None and self._geo_dists[i] is not None:
+                        _dyn_V[i] = dgeo.compute(
+                            self._geo_dists[i], ped_traj_std)
+                self._dgeo_V = _dyn_V
+
+        # phi0: potential before action
+        if _dyn_V is not None:
+            phi0 = []
+            for i in range(N):
+                if _dyn_V[i] is not None:
+                    d = self._dgeo_fields[i].query(
+                        _dyn_V[i], self._get_xz(i), t=0)
+                    phi0.append(-d if np.isfinite(d) else self._potential(i))
+                else:
+                    phi0.append(self._geodesic_potential(i))
+        else:
+            # phi0 = [self._potential(i) for i in range(N)]      # Euclidean
+            phi0 = [self._geodesic_potential(i) for i in range(N)]
         pre_xz = [self._get_xz(i).copy() for i in range(N)]
 
         # Parse per-agent waypoints (camera frame)
@@ -1208,10 +1267,10 @@ class CarlaMultiAgentEnv:
                 'cmd_speed': float(np.sqrt(vx**2 + vz**2)),
             })
 
-        # ── Cache obstacle positions (used by SFM + collision check) ──
-        self._cached_obs_pos_ue = self.obstacle_mgr.get_obstacle_positions_ue()
+        _t_pre = time.perf_counter() - _t_pre0
 
         # ── Execute sub-steps ──
+        _t_step0 = time.perf_counter()
         if self.use_mpc:
             self._step_mpc_all(per_agent_waypoints)
         elif self.teleport:
@@ -1231,7 +1290,9 @@ class CarlaMultiAgentEnv:
                 vz = dz / (self.dt * self.n_skips)
                 vels.append((vx, vz))
             self._step_physics_all(vels)
+        _t_step = time.perf_counter() - _t_step0
 
+        _t_reward0 = time.perf_counter()
         obs_pos_ue = self._cached_obs_pos_ue
         ped_pos_ue = self.ped_mgr.get_pedestrian_positions_ue()
 
@@ -1251,8 +1312,13 @@ class CarlaMultiAgentEnv:
             self.path_lengths[i] += float(np.linalg.norm(real_disp))
             self.step_counts[i] += 1
 
-            # phi1 = self._potential(i)                        # Euclidean
-            phi1 = self._geodesic_potential(i)                  # geodesic
+            # phi1: potential after action
+            if _dyn_V is not None and _dyn_V[i] is not None:
+                d1 = self._dgeo_fields[i].query(
+                    _dyn_V[i], post_xz, t=self.n_skips)
+                phi1 = -d1 if np.isfinite(d1) else self._potential(i)
+            else:
+                phi1 = self._geodesic_potential(i)
             dist = self._distance_to_goal(i)                    # Euclidean (for success check)
 
             # reward (DD-PPO style)
@@ -1316,9 +1382,11 @@ class CarlaMultiAgentEnv:
             if terminated or truncated:
                 # determine agents at the termination condition
                 reset_set.append(i)
+        _t_reward = time.perf_counter() - _t_reward0
 
         # ── Capture terminal observations for truncated (not terminated)
         #    agents BEFORE auto-reset, so the trainer can bootstrap V(s_T).
+        _t_reset0 = time.perf_counter()
         terminal_obs = {}
         for i in reset_set:
             if truncateds[i] and not terminateds[i]:
@@ -1343,8 +1411,18 @@ class CarlaMultiAgentEnv:
                     [self._get_observation(i) for i in range(N)])
                 # Keep infos from the terminal step (contains is_success,
                 # distance_to_goal, etc.) — don't overwrite with post-reset info
+                _t_reset = time.perf_counter() - _t_reset0
+                _step_timing = {
+                    'env_pre_step_time': _t_pre,
+                    'env_stepping_time': _t_step,
+                    'env_reward_time': _t_reward,
+                    'env_reset_time': _t_reset,
+                    'env_obs_time': 0.0,
+                }
                 for i, tobs in terminal_obs.items():
                     infos[i]['terminal_observation'] = tobs
+                for info in infos:
+                    info.update(_step_timing)
                 return obs, rewards, terminateds, truncateds, infos
 
             # Normal auto-reset (same map)
@@ -1406,8 +1484,23 @@ class CarlaMultiAgentEnv:
                     # agents stay in sync (fixes stale-pose bug)
                     self._update_buffer(i)
 
+        _t_reset = time.perf_counter() - _t_reset0
+
+        _t_obs0 = time.perf_counter()
         obs = self._stack_obs(
             [self._get_observation(i) for i in range(N)])
+        _t_obs = time.perf_counter() - _t_obs0
+
+        # Attach detailed env-side timing to all info dicts
+        _step_timing = {
+            'env_pre_step_time': _t_pre,
+            'env_stepping_time': _t_step,
+            'env_reward_time': _t_reward,
+            'env_reset_time': _t_reset,
+            'env_obs_time': _t_obs,
+        }
+        for info in infos:
+            info.update(_step_timing)
         # Attach terminal observations for truncated agents
         for i, tobs in terminal_obs.items():
             infos[i]['terminal_observation'] = tobs
@@ -1698,7 +1791,36 @@ class CarlaMultiAgentEnv:
             goal_std = (self.goal_globals[i].copy()
                         if self.goal_globals[i] is not None
                         else ego_std)
+            # Re-trace geodesic from the *current* position so the path
+            # starts at ego_std rather than the (possibly stale) spawn
+            # position recorded at episode reset.
             geo_path = self._geo_paths[i]
+            if (self._dynamic_geo_mode == 'timespace'
+                    and self._dgeo_fields[i] is not None
+                    and self._dgeo_V[i] is not None
+                    and self._geo_dists[i] is not None):
+                geo_path = self._dgeo_fields[i].trace_path(
+                    self._dgeo_V[i], ego_std, self._geo_dists[i])
+            elif (self._geo_grids[i] is not None
+                    and self._geo_dists[i] is not None):
+                geo_path = self._geo_grids[i].trace_path(
+                    self._geo_dists[i], ego_std)
+            # Geodesic field data for heatmap visualisation
+            geo = self._geo_grids[i]
+            geo_grid_meta = None
+            geo_field_2d = None
+            geo_field_3d = None
+            if geo is not None:
+                geo_grid_meta = {
+                    'x_min': geo._x_min, 'z_min': geo._z_min,
+                    'resolution': geo._resolution,
+                    'H': geo._H, 'W': geo._W,
+                }
+                if self._geo_dists[i] is not None:
+                    geo_field_2d = self._geo_dists[i]
+                if self._dgeo_V[i] is not None:
+                    geo_field_3d = self._dgeo_V[i]
+
             agents.append({
                 'ego_std': ego_std,
                 'goal_std': goal_std,
@@ -1710,6 +1832,9 @@ class CarlaMultiAgentEnv:
                 'region_scenarios': self.obstacle_mgr.get_region_scenarios(i),
                 'town': self._current_town or '?',
                 'quadrant': _QUADRANT_NAMES[i] if i < len(_QUADRANT_NAMES) else f'region {i}',
+                'geo_grid_meta': geo_grid_meta,
+                'geo_field_2d': geo_field_2d,
+                'geo_field_3d': geo_field_3d,
             })
         layout['agents'] = agents
         return layout

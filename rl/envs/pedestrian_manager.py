@@ -495,6 +495,109 @@ class PedestrianManager:
 
         return {'pedestrians': result}
 
+    def predict_trajectories_std(
+        self,
+        horizon_steps: int,
+        dt: float,
+        obstacle_positions_ue: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
+        """Forward-simulate SFM pedestrian trajectories in pure numpy.
+
+        Runs the same force model as :meth:`update` but without touching
+        CARLA actors — uses current actor state as initial conditions and
+        integrates forward for *horizon_steps* steps.
+
+        When a simulated pedestrian reaches its destination it decelerates
+        in place (we cannot sample a new navmesh destination without CARLA).
+
+        Parameters
+        ----------
+        horizon_steps : int
+            Number of simulation steps to predict.
+        dt : float
+            Time step per simulation step (seconds).
+        obstacle_positions_ue : (M, 2) or None
+            Static obstacle positions in UE frame.
+
+        Returns
+        -------
+        positions_std : (horizon_steps, N, 2)
+            Predicted pedestrian positions in standard frame ``(x_std, z_std)``.
+            Empty ``(horizon_steps, 0, 2)`` if no pedestrians.
+        """
+        if not self.enabled or not self.pedestrians:
+            return np.empty((max(horizon_steps, 1), 0, 2))
+
+        cfg = self.config
+        n = len(self.pedestrians)
+
+        # -- gather initial state from CARLA actors --
+        pos = np.zeros((n, 2))
+        vel = np.zeros((n, 2))
+        dests = np.zeros((n, 2))
+        speeds = np.zeros(n)
+        for i, ped in enumerate(self.pedestrians):
+            loc = ped.actor.get_location()
+            pos[i] = (loc.x, loc.y)
+            v = ped.actor.get_velocity()
+            vel[i] = (v.x, v.y)
+            if ped.destination_ue is not None:
+                dests[i] = ped.destination_ue[:2]
+            speeds[i] = ped.desired_speed
+
+        # -- forward simulate --
+        out = np.empty((horizon_steps, n, 2))
+        for t in range(horizon_steps):
+            out[t] = pos
+
+            # destination reached → decelerate in place
+            d2d_vec = dests - pos
+            d2d = np.linalg.norm(d2d_vec, axis=1, keepdims=True)
+            d2d = np.maximum(d2d, 1e-6)
+            arrived = (d2d.squeeze(1) < cfg.dest_reach_threshold)
+
+            # 1. desired force
+            e_d = d2d_vec / d2d
+            f_desired = (speeds[:, None] * e_d - vel) / cfg.tau
+            f_desired[arrived] = -vel[arrived] / cfg.tau
+
+            # 2. ped–ped repulsion
+            diff_pp = pos[:, None, :] - pos[None, :, :]
+            dist_pp = np.linalg.norm(diff_pp, axis=2)
+            np.fill_diagonal(dist_pp, np.inf)
+            eff_dist = np.maximum(dist_pp - 2 * cfg.ped_radius, 0.0)
+            n_pp = diff_pp / np.maximum(dist_pp[:, :, None], 1e-6)
+            mask_pp = dist_pp < cfg.interaction_radius
+            mag_pp = cfg.A_ped * np.exp(-eff_dist / cfg.B_ped) * mask_pp
+            f_ped = (mag_pp[:, :, None] * n_pp).sum(axis=1)
+
+            # 3. obstacle repulsion
+            f_obs = np.zeros((n, 2))
+            if (obstacle_positions_ue is not None
+                    and obstacle_positions_ue.shape[0] > 0):
+                diff_po = (pos[:, None, :]
+                           - obstacle_positions_ue[None, :, :])
+                dist_po = np.linalg.norm(diff_po, axis=2)
+                n_po = diff_po / np.maximum(dist_po[:, :, None], 1e-6)
+                mask_po = dist_po < cfg.interaction_radius
+                mag_po = cfg.A_obs * np.exp(-dist_po / cfg.B_obs) * mask_po
+                f_obs = (mag_po[:, :, None] * n_po).sum(axis=1)
+
+            # 4. boundary repulsion (reuse precomputed edges)
+            f_boundary = self._compute_boundary_force(pos)
+
+            # integrate
+            f_total = f_desired + f_ped + f_obs + f_boundary
+            vel = vel + f_total * dt
+            spd = np.linalg.norm(vel, axis=1)
+            too_fast = spd > cfg.max_speed
+            vel[too_fast] *= cfg.max_speed / spd[too_fast, None]
+            pos = pos + vel * dt
+
+        # Convert UE (ue_x, ue_y) → standard (x_std, z_std) = (ue_y, ue_x)
+        out_std = out[:, :, ::-1].copy()
+        return out_std
+
     def get_pedestrian_positions_ue(self) -> np.ndarray:
         """Return (N, 2) pedestrian positions in UE (x, y)."""
         if not self.enabled or not self.pedestrians:

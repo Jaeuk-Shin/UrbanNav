@@ -89,6 +89,8 @@ python -m rl.ppo_trainer --num_envs 4 --gpu_ids 2,3,4,5 --carla_bin /raid/robot/
 | `--p_crosswalk_challenge` | float | `0.3` | Per-episode probability of the blocked-crosswalk (anti-greedy) scenario |
 | `--pedestrians` | flag | `False` | Enable SFM-controlled pedestrians |
 | `--num_pedestrians_per_region` | int | `30` | Number of SFM pedestrians per quadrant |
+| `--dynamic_geo_mode` | str | `off` | Dynamic geodesic reward mode: `off` (static), `soft` (heuristic swept-volume cost), `timespace` (exact time-space backward DP). Requires `--pedestrians`. See [rl/docs/dynamic_geodesic.md](rl/docs/dynamic_geodesic.md) |
+| `--dynamic_geo_horizon` | float | `5.0` | Prediction horizon (seconds) for dynamic geodesic reward |
 | `--weather` | flag | `False` | Randomize weather and sun position each episode |
 | `--navmesh_cache_dir` | str | `None` | Directory containing precomputed navmesh cache NPZ files. Speeds up crosswalk detection, walkable-area sampling, and enables geodesic reward |
 
@@ -257,6 +259,48 @@ To handle this, we use a **rasterized grid + Dijkstra** approach:
 When no navmesh cache is available, or the cache lacks walkable triangle data, the system falls back to Euclidean distance.
 
 The implementation lives in `rl/utils/geodesic.py` (`GeodesicDistanceField` class), with integration points in `rl/envs/carla_multi.py` (`_geodesic_potential`, `_update_geodesic`).
+
+#### Dynamic Geodesic Distance (`--dynamic_geo_mode`)
+
+The static geodesic field treats pedestrians as point-collision penalties ($-0.5$ on contact) but otherwise ignores them when computing the shortest path. With `--dynamic_geo_mode`, the distance field is **recomputed every step** to account for predicted pedestrian motion, giving the agent a denser shaping signal to route *around* pedestrians rather than only reacting on collision. Because pedestrians in our SFM do **not** react to the ego agent, their forward trajectories are deterministic given the current state and can be forward-simulated in pure NumPy.
+
+Two modes are available. See [rl/docs/dynamic_geodesic.md](rl/docs/dynamic_geodesic.md) for a full treatment including problem formulation, alternative methods (HJ reachability, MPC), feasibility analysis, and references.
+
+##### `timespace` — Exact Time-Space Backward DP (recommended)
+
+Expands the 2-D grid into a 3-D graph $(r, c, t)$ and computes the optimal value function $V(x, t)$ via backward dynamic programming:
+
+$$V(x, T) = d_{\text{static}}(x, g)$$
+
+$$V(x, t) = \min_{u \in \mathcal{N}(x) \cup \{x\}} \bigl[ w(x \to u) + V(u, t{+}1) \bigr], \quad x \notin \mathcal{O}(t)$$
+
+where $\mathcal{N}(x)$ are the 8-connected spatial neighbours, $\mathcal{O}(t)$ is the set of cells occupied by predicted pedestrians at time $t$, and $d_{\text{static}}$ is the pre-computed static geodesic (terminal cost connecting to the static field beyond the horizon). Since time provides a topological ordering, no priority queue is needed — a plain backward sweep gives the exact optimum.
+
+The reward queries the 3-D field at two time indices:
+
+$$r_t = r_{\text{success}} + \bigl( V(s_t, 0) - V(s_{t+1}, \Delta t) \bigr) - c_{\text{slack}} + r_{\text{collision}}$$
+
+where $\Delta t = $ `n_skips` (the number of simulation sub-steps per environment step).
+
+**Key advantage:** can represent the **wait** strategy — if a pedestrian is crossing a narrow passage, the optimal plan is to wait and then proceed through the cleared passage, rather than taking a long detour.
+
+**Complexity:** $O(H \times W \times T \times 9)$.  With a 100 $\times$ 100 quadrant grid and $T = 25$, this is ~2.25 M operations (~10–50 ms per agent).
+
+```bash
+python -m rl.ppo_trainer ... --pedestrians --dynamic_geo_mode timespace --dynamic_geo_horizon 5.0
+```
+
+##### `soft` — Heuristic Soft-Cost Approximation
+
+Collapses the time dimension into a single 2-D cost map by summing temporally-discounted exponential penalties over all predicted pedestrian positions:
+
+$$c(r,c) = \sum_{t=0}^{H-1}\sum_{i=1}^{N_{\text{ped}}} \alpha \, e^{-\lVert(r,c) - \hat{p}_i^{(t)}\rVert / \beta} \, \lambda^t$$
+
+($\alpha = 5.0$, $\beta = 0.5$ m, $\lambda = 0.85$/step). Dijkstra runs on the 2-D grid with edge weights $w_{\text{base}} + c(\text{dst})$. Faster (~5–10 ms) but **cannot represent waiting** — it over-penalises areas that are only briefly occupied.
+
+```bash
+python -m rl.ppo_trainer ... --pedestrians --dynamic_geo_mode soft --dynamic_geo_horizon 5.0
+```
 
 #### Building the Navmesh Cache
 

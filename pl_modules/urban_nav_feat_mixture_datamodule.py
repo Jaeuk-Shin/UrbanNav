@@ -63,6 +63,10 @@ class UrbanNavFeatMixtureDataModule(pl.LightningDataModule):
         if 'camera' in entry:
             data['camera'] = entry['camera']
 
+        # Per-dataset keep-list (produced by filter_episodes.py)
+        if 'keep_list' in entry:
+            data['keep_list'] = entry['keep_list']
+
         # Per-dataset episode counts (fall back to top-level defaults)
         for key in ('num_train', 'num_val', 'num_test'):
             if key in entry:

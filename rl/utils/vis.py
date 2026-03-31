@@ -77,6 +77,18 @@ def visualize(iteration, args, bufs, bev_images, bev_metas, wandb_module,
             wandb=wrun,
         )
 
+        log_mpc_detail_video_grid(
+            mpc_vis_data,
+            buf_cmd_speed=bufs.cmd_speed,
+            buf_real_speed=bufs.real_speed,
+            buf_dones=bufs.dones,
+            grid_cols=args.num_agents_per_server,
+            fps=args.vis_video_fps,
+            iteration=iteration,
+            save_dir=vis_dir,
+            wandb=wrun,
+        )
+
 
 # ─── BEV Trajectory Visualization ────────────────────────────────────
 
@@ -1549,6 +1561,211 @@ def log_mpc_dashboard(
     plt.close(fig)
 
 
+def _render_mpc_detail_frame(entry, step_idx, cmd_speed, real_speed,
+                             speed_history_len=32, fov_deg=110.0):
+    """Render a single MPC detail frame as an RGBA numpy array.
+
+    Panels (1 row, 3 columns):
+      0 — Camera-frame BEV: policy waypoints, MPC trajectory, FOV cone
+      1 — Z-coordinate over MPC horizon: open-loop vs waypoint reference
+      2 — Velocity commands over MPC horizon: v and omega
+
+    Returns (H, W, 3) uint8.
+    """
+    wp_cam = entry.get('policy_waypoints_cam')   # (F, 2) camera frame
+    x_sol = entry.get('mpc_x_sol')               # (horizon+1, 3)
+    u_sol = entry.get('mpc_u_sol')               # (horizon, 2)
+
+    fig, axes = plt.subplots(1, 3, figsize=(9.6, 3.2))
+    fig.subplots_adjust(wspace=0.38, left=0.06, right=0.97,
+                        top=0.86, bottom=0.16)
+
+    # ── Panel 0: Camera-frame BEV ────────────────────────────────────
+    ax_bev = axes[0]
+    fov_rad = math.radians(fov_deg)
+    half_fov = fov_rad / 2.0
+    r_line = np.linspace(0., 7., 80)
+    ax_bev.plot(r_line * math.cos(math.pi / 2 - half_fov),
+                r_line * math.sin(math.pi / 2 - half_fov),
+                '--', color='gray', linewidth=0.7, alpha=0.5)
+    ax_bev.plot(-r_line * math.cos(math.pi / 2 - half_fov),
+                r_line * math.sin(math.pi / 2 - half_fov),
+                '--', color='gray', linewidth=0.7, alpha=0.5)
+
+    # Policy waypoints
+    if wp_cam is not None and len(wp_cam) >= 1:
+        ax_bev.plot(wp_cam[:, 0], wp_cam[:, 1], 'o-',
+                    color='tab:green', markersize=4, linewidth=2,
+                    label='waypoints', zorder=3)
+
+    # MPC open-loop trajectory
+    if x_sol is not None and len(x_sol) >= 2:
+        mpc_xz = x_sol[:, [0, 1]]  # (x_cam, z_cam)
+        ax_bev.plot(mpc_xz[:, 0], mpc_xz[:, 1],
+                    color='teal', linewidth=2.5,
+                    label='MPC open-loop', zorder=4)
+
+    # Origin marker (ego)
+    ax_bev.scatter([0], [0], marker='^', s=60, c='white',
+                   edgecolors='black', zorder=5)
+
+    ax_bev.set_aspect('equal')
+    ax_bev.grid(True, alpha=0.3)
+    ax_bev.set_xlabel('x (m)', fontsize=8)
+    ax_bev.set_ylabel('z (m)', fontsize=8)
+    ax_bev.set_title(f'cam-frame BEV  [step {step_idx}]', fontsize=9)
+    ax_bev.legend(fontsize=6, loc='upper left')
+    ax_bev.tick_params(labelsize=7)
+
+    # ── Panel 1: Z-coordinate over horizon ───────────────────────────
+    ax_z = axes[1]
+    if x_sol is not None:
+        horizon = len(x_sol) - 1
+        ax_z.plot(np.arange(horizon + 1), x_sol[:, 1],
+                  color='teal', linewidth=1.5, label='MPC open-loop')
+    if wp_cam is not None:
+        n_wp = len(wp_cam)
+        if x_sol is not None:
+            # Waypoints are at indices 1, 1+n_skips, 1+2*n_skips, ...
+            n_skips = max(1, horizon // n_wp) if x_sol is not None else 1
+            wp_t = np.arange(1, n_wp + 1) * n_skips
+            wp_t = np.clip(wp_t, 0, horizon)
+        else:
+            wp_t = np.arange(1, n_wp + 1)
+        ax_z.plot(wp_t, wp_cam[:, 1], '--', color='teal',
+                  linewidth=1.2, alpha=0.7, label='waypoint ref')
+    ax_z.grid(True, alpha=0.3)
+    ax_z.set_xlabel('MPC step', fontsize=8)
+    ax_z.set_ylabel('z (m)', fontsize=8)
+    ax_z.set_title('z over horizon', fontsize=9)
+    ax_z.legend(fontsize=6)
+    ax_z.tick_params(labelsize=7)
+
+    # ── Panel 2: Velocity commands over horizon ──────────────────────
+    ax_v = axes[2]
+    if u_sol is not None and len(u_sol) >= 1:
+        t_u = np.arange(len(u_sol))
+        ax_v.plot(t_u, u_sol[:, 0], color='tab:purple',
+                  linewidth=1.2, label='v (m/s)')
+        ax_v.plot(t_u, u_sol[:, 1], color='tab:brown',
+                  linewidth=1.2, label='\u03c9 (rad/s)')
+    ax_v.grid(True, alpha=0.3)
+    ax_v.set_xlabel('MPC step', fontsize=8)
+    ax_v.set_title('velocity commands', fontsize=9)
+    ax_v.legend(fontsize=6, ncol=2, loc='upper right')
+    ax_v.tick_params(labelsize=7)
+
+    # ── Rasterise to numpy ───────────────────────────────────────────
+    fig.canvas.draw()
+    buf = np.asarray(fig.canvas.buffer_rgba())
+    frame = buf[:, :, :3].copy()
+    plt.close(fig)
+    return frame
+
+
+def log_mpc_detail_video_grid(
+    mpc_vis_data,
+    buf_cmd_speed=None,
+    buf_real_speed=None,
+    buf_dones=None,
+    grid_cols=None,
+    fps=5,
+    iteration=0,
+    save_dir=None,
+    wandb=None,
+):
+    """
+    Render a grid video of per-step MPC planning-horizon details.
+
+    Each cell shows one env's multi-panel figure (camera-frame BEV with
+    FOV cone + waypoints + MPC trajectory; z open-loop vs reference;
+    velocity profile over the planning horizon).  One frame per policy
+    step — gives a step-by-step view of what the MPC sees and plans.
+
+    Parameters
+    ----------
+    mpc_vis_data : list[list[dict]]
+        ``mpc_vis_data[env_idx][step]`` is a dict with optional keys
+        ``policy_waypoints_cam``, ``mpc_x_sol``, ``mpc_u_sol``.
+    buf_cmd_speed, buf_real_speed : (num_steps, num_envs) or None
+    buf_dones : (num_steps, num_envs) or None
+    """
+    try:
+        import imageio  # noqa: F401
+    except ImportError:
+        print("  [video] imageio not found; "
+              "run: pip install imageio imageio-ffmpeg")
+        return
+
+    num_envs = len(mpc_vis_data)
+    num_steps = max((len(d) for d in mpc_vis_data), default=0)
+    if num_steps == 0:
+        return
+
+    if grid_cols is None:
+        grid_cols = math.ceil(math.sqrt(num_envs))
+    grid_rows = math.ceil(num_envs / grid_cols)
+
+    # ── Render per-env frame sequences ───────────────────────────────
+    # Render one reference frame to get the cell size
+    _ref = mpc_vis_data[0][0] if mpc_vis_data[0] else {}
+    ref_frame = _render_mpc_detail_frame(_ref, 0, 0.0, 0.0)
+    cell_h, cell_w = ref_frame.shape[:2]
+
+    # Pre-allocate grid frames
+    grid_H = cell_h * grid_rows
+    grid_W = cell_w * grid_cols
+    grid_frames = []
+
+    for step in range(num_steps):
+        grid_frame = np.zeros((grid_H, grid_W, 3), dtype=np.uint8)
+        for env_idx in range(num_envs):
+            r, c = divmod(env_idx, grid_cols)
+            if step < len(mpc_vis_data[env_idx]):
+                entry = mpc_vis_data[env_idx][step]
+            else:
+                entry = {}
+
+            cs = 0.0
+            rs = 0.0
+            if buf_cmd_speed is not None and step < buf_cmd_speed.shape[0]:
+                cs = float(buf_cmd_speed[step, env_idx])
+            if buf_real_speed is not None and step < buf_real_speed.shape[0]:
+                rs = float(buf_real_speed[step, env_idx])
+
+            cell = _render_mpc_detail_frame(entry, step, cs, rs)
+            # Resize if needed (should match ref_frame)
+            y0, x0 = r * cell_h, c * cell_w
+            grid_frame[y0:y0 + cell_h, x0:x0 + cell_w] = cell[:cell_h, :cell_w]
+
+        grid_frames.append(grid_frame)
+
+    grid_video = np.array(grid_frames, dtype=np.uint8)
+
+    # ── Write to disk ────────────────────────────────────────────────
+    stem = f"mpc_detail_{iteration:04d}"
+    if save_dir is not None:
+        os.makedirs(save_dir, exist_ok=True)
+        base = os.path.join(save_dir, stem)
+        path = _write_video(grid_video, base, fps)
+    else:
+        import tempfile
+        tmp_dir = tempfile.mkdtemp()
+        path = _write_video(grid_video, os.path.join(tmp_dir, stem), fps)
+
+    if path is None:
+        return
+
+    print(f"  → MPC detail video ({grid_rows}×{grid_cols}, "
+          f"{num_steps} steps) saved to {path}")
+
+    if wandb is not None:
+        wandb.log({
+            "rollout/mpc_detail_video": wandb.Video(path, fps=fps,
+                                                     format="mp4"),
+        })
+
+
 def _minimap_ring_distances(map_radius):
     """Choose clean distance-ring values for the minimap."""
     # Pick 2-3 rings at round intervals
@@ -1557,6 +1774,256 @@ def _minimap_ring_distances(map_radius):
     if not rings:
         rings = [map_radius * 0.5]
     return rings[:3]
+
+
+# ── Geodesic distance field heatmap / video ──────────────────────────
+
+def log_geodesic_field(
+    obstacle_layouts,
+    bev_metas,
+    grid_cols=None,
+    iteration=0,
+    save_dir=None,
+    wandb=None,
+    video_fps=5,
+):
+    """Render geodesic distance field as a heatmap image or time-space video.
+
+    For static / soft-cost fields (2-D), produces a single PNG figure.
+    For time-space fields (3-D), produces an MP4 video where each frame
+    shows the value field at one time step.
+
+    Parameters
+    ----------
+    obstacle_layouts : list[dict]
+        Per-server layouts from ``get_obstacle_layouts()``.
+    bev_metas : list[dict | None]
+        Per-env BEV projection metadata.
+    """
+    if not obstacle_layouts:
+        return
+
+    # ── Collect per-env agent data ────────────────────────────────────
+    agents_flat = []       # list of per-env agent dicts
+    metas_flat = []
+    for server_layout in obstacle_layouts:
+        if server_layout is None:
+            continue
+        for ag in server_layout.get('agents', []):
+            agents_flat.append(ag)
+    num_envs = len(agents_flat)
+    if num_envs == 0:
+        return
+    metas_flat = (bev_metas or [None] * num_envs)[:num_envs]
+
+    has_3d = any(ag.get('geo_field_3d') is not None for ag in agents_flat)
+
+    if has_3d:
+        _log_geodesic_video(agents_flat, metas_flat, grid_cols,
+                            iteration, save_dir, wandb, video_fps)
+    else:
+        fig = _render_geodesic_frame(agents_flat, metas_flat, grid_cols,
+                                     t=None)
+        if fig is None:
+            return
+        if save_dir is not None:
+            os.makedirs(save_dir, exist_ok=True)
+            fig.savefig(os.path.join(save_dir,
+                        f"geodesic_field_{iteration:04d}.png"), dpi=120)
+        if wandb is not None:
+            wandb.log({"rollout/geodesic_field": wandb.Image(fig)},
+                      step=iteration)
+        plt.close(fig)
+
+
+def _log_geodesic_video(agents, metas, grid_cols, iteration,
+                         save_dir, wandb, fps):
+    """Assemble a time-space geodesic field video."""
+    # Determine max T across agents
+    T_max = 0
+    for ag in agents:
+        f3 = ag.get('geo_field_3d')
+        if f3 is not None:
+            T_max = max(T_max, f3.shape[0] - 1)
+    if T_max == 0:
+        return
+
+    frames = []
+    for t in range(T_max + 1):
+        fig = _render_geodesic_frame(agents, metas, grid_cols, t=t)
+        if fig is None:
+            continue
+        fig.canvas.draw()
+        buf = np.asarray(fig.canvas.buffer_rgba())
+        frames.append(buf[:, :, :3].copy())
+        plt.close(fig)
+
+    if not frames:
+        return
+
+    if save_dir is not None:
+        os.makedirs(save_dir, exist_ok=True)
+        base = os.path.join(save_dir, f"geodesic_field_{iteration:04d}")
+        vid_path = _write_video(frames, base, fps)
+    else:
+        vid_path = None
+
+    if wandb is not None:
+        if vid_path is not None:
+            wandb.log({"rollout/geodesic_field_video":
+                       wandb.Video(vid_path, fps=fps, format="mp4")},
+                      step=iteration)
+        else:
+            # Fallback: log first frame as image
+            fig = _render_geodesic_frame(agents, metas, grid_cols, t=0)
+            if fig is not None:
+                wandb.log({"rollout/geodesic_field": wandb.Image(fig)},
+                          step=iteration)
+                plt.close(fig)
+
+
+def _render_geodesic_frame(agents, metas, grid_cols, t=None):
+    """Render one frame of the geodesic field heatmap grid.
+
+    Parameters
+    ----------
+    agents : list[dict]   — per-env agent dicts with geo data.
+    metas  : list[dict]   — per-env BEV metadata.
+    grid_cols : int | None
+    t : int | None
+        Time index into geo_field_3d.  ``None`` means use geo_field_2d.
+
+    Returns
+    -------
+    fig : matplotlib.Figure or None
+    """
+    from matplotlib.colors import Normalize
+    from matplotlib.cm import ScalarMappable
+
+    num_envs = len(agents)
+    if grid_cols is None:
+        grid_cols = math.ceil(math.sqrt(num_envs))
+    grid_rows = math.ceil(num_envs / grid_cols)
+    cell = 4.5
+
+    BG = '#1A1A2E'
+    CMAP = 'plasma_r'
+
+    fig, axes = plt.subplots(grid_rows, grid_cols,
+                             figsize=(cell * grid_cols,
+                                      cell * grid_rows + 0.4),
+                             squeeze=False)
+    fig.subplots_adjust(left=0.02, right=0.90, top=0.95, bottom=0.02,
+                        wspace=0.05, hspace=0.05)
+    fig.patch.set_facecolor(BG)
+
+    if t is not None:
+        fig.suptitle(f"t = {t}", color='white', fontsize=12, y=0.98)
+
+    # Shared colour limits across envs for comparability
+    vmin, vmax = np.inf, 0.0
+    for ag in agents:
+        field = _pick_field(ag, t)
+        if field is None:
+            continue
+        finite = field[np.isfinite(field)]
+        if finite.size == 0:
+            continue
+        vmin = min(vmin, float(finite.min()))
+        vmax = max(vmax, float(np.percentile(finite, 97)))
+    if vmin >= vmax:
+        vmin, vmax = 0.0, 1.0
+
+    for idx in range(num_envs):
+        row_i, col_i = divmod(idx, grid_cols)
+        ax = axes[row_i][col_i]
+        ax.set_facecolor(BG)
+        ax.set_xticks([])
+        ax.set_yticks([])
+        for sp in ax.spines.values():
+            sp.set_visible(False)
+
+        ag = agents[idx]
+        meta = metas[idx] if idx < len(metas) else None
+        gm = ag.get('geo_grid_meta')
+        field = _pick_field(ag, t)
+
+        if field is None or gm is None:
+            ax.set_visible(False)
+            continue
+
+        H, W = gm['H'], gm['W']
+        res = gm['resolution']
+        x_min, z_min = gm['x_min'], gm['z_min']
+        x_max = x_min + W * res
+        z_max = z_min + H * res
+
+        # Prepare display array: NaN for unreachable (renders transparent)
+        disp = field.astype(np.float64).copy()
+        disp[~np.isfinite(disp)] = np.nan
+
+        # imshow with origin='lower' so row 0 = z_min = bottom
+        ax.imshow(disp, origin='lower', cmap=CMAP,
+                  vmin=vmin, vmax=vmax,
+                  extent=[x_min, x_max, z_min, z_max],
+                  aspect='equal', interpolation='nearest')
+
+        # Viewport from BEV meta (zoom to match other BEV figures)
+        if meta is not None:
+            ctr = meta['center_xz']
+            alt = meta['altitude']
+            fov_rad = np.deg2rad(meta.get('fov_deg', 90.0))
+            half = alt * np.tan(fov_rad / 2.0)
+            ax.set_xlim(ctr[0] - half, ctr[0] + half)
+            ax.set_ylim(ctr[1] - half, ctr[1] + half)
+        else:
+            ax.set_xlim(x_min, x_max)
+            ax.set_ylim(z_min, z_max)
+
+        # Overlay: geodesic path (cyan)
+        gp = ag.get('geodesic_path_std')
+        if gp is not None and len(gp) > 1:
+            gp = np.asarray(gp)
+            ax.plot(gp[:, 0], gp[:, 1], '-', color='#00E5FF',
+                    linewidth=1.5, alpha=0.8, zorder=3)
+
+        # Overlay: ego (green) and goal (blue)
+        ego = ag.get('ego_std')
+        goal = ag.get('goal_std')
+        if ego is not None:
+            ax.plot(ego[0], ego[1], '^', color='#43E97B',
+                    markersize=8, markeredgecolor='white',
+                    markeredgewidth=0.5, zorder=5)
+        if goal is not None:
+            ax.plot(goal[0], goal[1], '*', color='#667EEA',
+                    markersize=10, markeredgecolor='white',
+                    markeredgewidth=0.5, zorder=5)
+
+    # Hide unused axes
+    for idx in range(num_envs, grid_rows * grid_cols):
+        row_i, col_i = divmod(idx, grid_cols)
+        axes[row_i][col_i].set_visible(False)
+
+    # Shared colorbar
+    sm = ScalarMappable(cmap=CMAP, norm=Normalize(vmin=vmin, vmax=vmax))
+    sm.set_array([])
+    cax = fig.add_axes([0.92, 0.15, 0.015, 0.65])
+    cb = fig.colorbar(sm, cax=cax)
+    cb.set_label('distance to goal (m)', color='white', fontsize=9)
+    cb.ax.yaxis.set_tick_params(color='white', labelcolor='white',
+                                labelsize=7)
+
+    return fig
+
+
+def _pick_field(ag, t):
+    """Select the right 2-D slice for rendering."""
+    if t is not None:
+        f3 = ag.get('geo_field_3d')
+        if f3 is not None and t < f3.shape[0]:
+            return f3[t]
+        # Beyond horizon: fall back to 2D static
+    return ag.get('geo_field_2d')
 
 
 def _write_video(frames, base_path, fps):

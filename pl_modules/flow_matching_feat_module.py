@@ -177,6 +177,15 @@ class FlowMatchingFeatModule(pl.LightningModule):
                 and os.path.exists(batch['image_path'][idx])
             )
 
+            # Check if a video file is available for on-the-fly extraction
+            has_video = (
+                not has_image
+                and 'video_path' in batch
+                and idx < len(batch['video_path'])
+                and batch['video_path'][idx]
+                and batch['video_frame_idx'][idx].item() >= 0
+            )
+
             # Per-sample camera params (sentinel -1 means absent)
             has_camera = (
                 cam_all is not None
@@ -191,11 +200,21 @@ class FlowMatchingFeatModule(pl.LightningModule):
                 fx = fy = cx = cy = dw = dh = 0.0
                 fov = None
 
-            if has_image and has_camera:
+            # Obtain raw image from either pre-split frames or video
+            img = None
+            if has_image:
+                img = Image.open(batch['image_path'][idx]).convert('RGB')
+            elif has_video:
+                img = self._extract_video_frame(
+                    batch['video_path'][idx],
+                    batch['video_frame_idx'][idx].item(),
+                )
+
+            if img is not None and has_camera:
                 fig, (ax_img, ax_coord) = plt.subplots(1, 2, figsize=(12, 6))
                 plt.subplots_adjust(wspace=0.3)
                 self._draw_image_panel(
-                    ax_img, batch['image_path'][idx],
+                    ax_img, img,
                     gt_waypoints, pred_waypoints,
                     batch['gt_waypoints_y'][idx].cpu().numpy(),
                     fx=fx, fy=fy, cx=cx, cy=cy,
@@ -216,11 +235,25 @@ class FlowMatchingFeatModule(pl.LightningModule):
 
     # -- visualisation helpers --------------------------------------------------
 
-    def _draw_image_panel(self, ax, image_path, gt_waypoints, pred_waypoints,
+    @staticmethod
+    def _extract_video_frame(video_path, frame_idx):
+        """Extract a single frame from a video file using decord."""
+        from decord import VideoReader, cpu
+        vr = VideoReader(video_path, ctx=cpu(0))
+        frame_idx = min(frame_idx, len(vr) - 1)
+        frame = vr[frame_idx].asnumpy()  # (H, W, 3) uint8
+        return Image.fromarray(frame)
+
+    def _draw_image_panel(self, ax, img, gt_waypoints, pred_waypoints,
                           gt_waypoints_y, *, fx, fy, cx, cy,
                           desired_width, desired_height):
-        """Render the raw image with projected waypoint overlays."""
-        img = Image.open(image_path).convert('RGB')
+        """Render the raw image with projected waypoint overlays.
+
+        Parameters
+        ----------
+        img : PIL.Image.Image
+            The raw RGB frame (from file or video extraction).
+        """
         W_orig, H_orig = img.size
 
         dw = int(desired_width)

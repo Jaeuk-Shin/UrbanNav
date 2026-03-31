@@ -61,7 +61,7 @@ data:
   input_noise: 0.1
   horizontal_flip_prob: 0.5
   mixture:
-    - root: '/home3/rvl/dataset/carla'
+    - root: '/home3/rvl/dataset/carla/v0.1'
       weight: 0.3
       camera:
         width: 640

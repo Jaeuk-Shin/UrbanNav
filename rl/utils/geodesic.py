@@ -99,6 +99,8 @@ class GeodesicDistanceField:
 
         # Rasterize walkable triangles (one-time per map)
         self._base_grid = self._rasterize(walkable_tris_std)
+        # Cached static-obstacle grid (set by compute_distance_field)
+        self._static_walkable: np.ndarray | None = None
 
         n_walk = int(self._base_grid.sum())
         print(f"  [Geodesic] Grid {self._H}x{self._W} @ {resolution}m, "
@@ -186,6 +188,9 @@ class GeodesicDistanceField:
                 self._stamp_obstacles(grid, obstacle_obbs_std, obstacle_buffer)
             walkable = grid.astype(bool)
 
+        # Cache the static-obstacle-blocked grid for dynamic updates
+        self._static_walkable = walkable.copy()
+
         # Find goal cell; snap to nearest walkable if needed
         goal_r, goal_c = self._to_cell(goal_std)
         goal_r = int(np.clip(goal_r, 0, self._H - 1))
@@ -202,6 +207,132 @@ class GeodesicDistanceField:
         dists = sp_dijkstra(graph, indices=goal_idx, directed=False)
 
         return dists.reshape(self._H, self._W)
+
+    def compute_distance_field_dynamic(
+        self,
+        goal_std: np.ndarray,
+        ped_positions_std: np.ndarray,
+        cost_scale: float = 5.0,
+        cost_decay: float = 0.5,
+        temporal_discount: float = 0.85,
+    ) -> np.ndarray:
+        """Recompute distance field with soft pedestrian-proximity costs.
+
+        Uses the static-obstacle grid cached by the last call to
+        :meth:`compute_distance_field`.  Instead of hard-blocking cells
+        (which would be overly conservative over a multi-second swept
+        volume), each cell near a predicted pedestrian position receives
+        an additive edge-weight penalty:
+
+        .. math::
+
+            c(r,c) = \\sum_{t,i} \\alpha \\, e^{-d / \\beta} \\, \\lambda^{t}
+
+        where :math:`d` is the Euclidean distance from cell ``(r, c)``
+        to pedestrian :math:`i` at time :math:`t`, :math:`\\alpha` is
+        ``cost_scale``, :math:`\\beta` is ``cost_decay``, and
+        :math:`\\lambda` is ``temporal_discount``.  This lets Dijkstra
+        route *around* pedestrians when cheap detours exist but still
+        *through* them when no alternative is available.
+
+        Parameters
+        ----------
+        goal_std : (2,) array
+            Goal position in standard coords.
+        ped_positions_std : (T, N, 2) or (N, 2) float
+            Predicted pedestrian positions in standard coords.
+        cost_scale : float
+            Peak cost (metres-equivalent) added at a pedestrian's centre.
+        cost_decay : float
+            Spatial decay length (metres) for the exponential penalty.
+        temporal_discount : float
+            Per-step discount factor; positions further in the future
+            contribute less cost.  Set to 1.0 for uniform weighting.
+
+        Returns
+        -------
+        dist_field : (H, W) float64
+        """
+        if self._static_walkable is None:
+            raise RuntimeError(
+                "Call compute_distance_field() first to build the static grid")
+
+        walkable = self._static_walkable   # read-only; not modified
+
+        # Compute soft cost map from pedestrian predictions
+        pts = np.asarray(ped_positions_std, dtype=np.float64)
+        if pts.ndim == 2:
+            pts = pts[np.newaxis]            # (1, N, 2)
+        cost_map = None
+        if pts.shape[1] > 0:
+            cost_map = self._compute_ped_cost_map(
+                pts, cost_scale, cost_decay, temporal_discount)
+
+        # Goal cell (same snapping logic as compute_distance_field)
+        goal_r, goal_c = self._to_cell(goal_std)
+        goal_r = int(np.clip(goal_r, 0, self._H - 1))
+        goal_c = int(np.clip(goal_c, 0, self._W - 1))
+
+        if not walkable[goal_r, goal_c]:
+            goal_r, goal_c = self._snap_to_walkable(walkable, goal_r, goal_c)
+            if goal_r is None:
+                return np.full((self._H, self._W), np.inf)
+
+        graph = self._build_graph(walkable, cost_map=cost_map)
+        goal_idx = goal_r * self._W + goal_c
+        dists = sp_dijkstra(graph, indices=goal_idx, directed=False)
+        return dists.reshape(self._H, self._W)
+
+    def _compute_ped_cost_map(
+        self,
+        ped_positions_std: np.ndarray,
+        cost_scale: float,
+        cost_decay: float,
+        temporal_discount: float,
+    ) -> np.ndarray:
+        """Build a soft per-cell cost map from predicted pedestrian positions.
+
+        Parameters
+        ----------
+        ped_positions_std : (T, N, 2) float64
+            Predicted positions in standard coords across T time steps.
+
+        Returns
+        -------
+        cost_map : (H, W) float64 — additive cost per cell (metres).
+        """
+        cost = np.zeros((self._H, self._W), dtype=np.float64)
+        origin = np.array([self._x_min, self._z_min])
+        res = self._resolution
+        # Spatial cutoff at ~3 decay lengths (contribution < 5 %)
+        cutoff = int(np.ceil(3.0 * cost_decay / res))
+
+        T = ped_positions_std.shape[0]
+        for t in range(T):
+            discount = temporal_discount ** t
+            if discount < 0.01:
+                break
+
+            centres = np.round(
+                (ped_positions_std[t] - origin) / res
+            ).astype(np.int32)              # (N, 2)  col=x, row=z
+
+            scaled = discount * cost_scale
+            for cx, cz in centres:
+                r_lo = max(0, cz - cutoff)
+                r_hi = min(self._H, cz + cutoff + 1)
+                c_lo = max(0, cx - cutoff)
+                c_hi = min(self._W, cx + cutoff + 1)
+                if r_lo >= r_hi or c_lo >= c_hi:
+                    continue
+                rr = np.arange(r_lo, r_hi)
+                cc = np.arange(c_lo, c_hi)
+                dr = (rr - cz)[:, None]
+                dc = (cc - cx)[None, :]
+                d = np.sqrt(dr * dr + dc * dc) * res
+                cost[r_lo:r_hi, c_lo:c_hi] += scaled * np.exp(-d / cost_decay)
+
+        return cost
 
     def _stamp_obstacles(self, grid_u8, obstacle_obbs_std, buffer):
         """Mark cells inside obstacle OBBs (optionally inflated) as blocked."""
@@ -245,8 +376,18 @@ class GeodesicDistanceField:
 
     # ── Graph construction ────────────────────────────────────────────
 
-    def _build_graph(self, walkable: np.ndarray) -> csr_matrix:
-        """Build 8-connected sparse adjacency with Euclidean edge weights."""
+    def _build_graph(self, walkable: np.ndarray,
+                     cost_map: np.ndarray | None = None) -> csr_matrix:
+        """Build 8-connected sparse adjacency with Euclidean edge weights.
+
+        Parameters
+        ----------
+        walkable : (H, W) bool
+        cost_map : (H, W) float64, optional
+            Additive per-cell cost.  When provided, each edge's weight
+            becomes ``base_weight + cost_map[dst_row, dst_col]``
+            (node-entry cost model).
+        """
         H, W = walkable.shape
         N = H * W
         idx = np.arange(N, dtype=np.int32).reshape(H, W)
@@ -272,7 +413,11 @@ class GeodesicDistanceField:
 
             src_parts.append(idx[ss][valid].ravel())
             dst_parts.append(idx[ds][valid].ravel())
-            w_parts.append(np.full(n_valid, w, dtype=np.float32))
+
+            weights = np.full(n_valid, w, dtype=np.float32)
+            if cost_map is not None:
+                weights = weights + cost_map[ds][valid].astype(np.float32)
+            w_parts.append(weights)
 
         if not src_parts:
             return csr_matrix((N, N), dtype=np.float32)

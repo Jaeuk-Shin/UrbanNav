@@ -41,6 +41,7 @@ from rl.goal_only_agent import GoalOnlyMLPAgent
 from rl.utils.vis import (visualize, compute_bev_specs,
                           compute_episode_bev_specs, log_complete_episode_bev,
                           log_obstacle_bev_figure,
+                          log_geodesic_field,
                           WeatherTracker, log_weather_distributions)
 from rl.utils.logger import log_metrics, EpisodeTracker, EpisodeTrajectoryAccumulator
 from rl.utils.buffer import RolloutBuffers, compute_gae
@@ -281,6 +282,14 @@ def train(args):
         print(f"  SFM pedestrians ENABLED "
               f"({args.num_pedestrians_per_region}/region)")
 
+    if args.dynamic_geo_mode != 'off':
+        if not args.pedestrians:
+            print(f"  WARNING: --dynamic_geo_mode={args.dynamic_geo_mode} "
+                  f"has no effect without --pedestrians")
+        else:
+            print(f"  Dynamic geodesic reward: {args.dynamic_geo_mode} "
+                  f"(horizon={args.dynamic_geo_horizon}s)")
+
     if args.weather:
         print("  Weather randomisation ENABLED")
 
@@ -305,6 +314,8 @@ def train(args):
         quadrant_margin=args.quadrant_margin,
         randomize_weather=args.weather,
         use_mpc=args.use_mpc,
+        dynamic_geo_mode=args.dynamic_geo_mode,
+        dynamic_geo_horizon=args.dynamic_geo_horizon,
     )
 
     # num_envs = total rollout slots (servers × agents_per_server),
@@ -787,6 +798,22 @@ def train(args):
                     except Exception as e:
                         print(f"  [BEV-obstacle] obstacle layout vis failed: {e}")
 
+                # ── geodesic distance field heatmap / video ──
+                if obstacle_layouts is not None and args.dynamic_geo_mode != 'off':
+                    try:
+                        vis_dir = os.path.join(args.save_dir, "vis")
+                        log_geodesic_field(
+                            obstacle_layouts,
+                            bev_metas,
+                            grid_cols=args.num_agents_per_server,
+                            iteration=iteration,
+                            save_dir=vis_dir,
+                            wandb=wandb,
+                            video_fps=args.vis_video_fps,
+                        )
+                    except Exception as e:
+                        print(f"  [BEV-geodesic] geodesic field vis failed: {e}")
+
                 # ── weather parameter distributions ──
                 if weather_tracker.num_samples > 0:
                     try:
@@ -882,6 +909,14 @@ if __name__ == "__main__":
                         help="Enable SFM-controlled pedestrians")
     parser.add_argument("--num_pedestrians_per_region", type=int, default=30,
                         help="Number of SFM pedestrians per quadrant")
+    parser.add_argument("--dynamic_geo_mode", type=str, default="off",
+                        choices=["off", "soft", "timespace"],
+                        help="Dynamic geodesic reward mode. "
+                             "'soft': heuristic soft-cost swept volume; "
+                             "'timespace': exact time-space backward DP. "
+                             "Requires --pedestrians.")
+    parser.add_argument("--dynamic_geo_horizon", type=float, default=5.0,
+                        help="Prediction horizon (seconds) for dynamic geodesic reward")
     # weather randomisation
     parser.add_argument("--weather", action="store_true", default=False,
                         help="Randomize weather and sun position each episode")

@@ -435,7 +435,9 @@ def _multi_env_worker(pipe, cfg_dict, port, num_agents, max_speed, fps,
                       navmesh_cache_dir=None,
                       quadrant_margin=None,
                       randomize_weather=False,
-                      use_mpc=False):
+                      use_mpc=False,
+                      dynamic_geo_mode='off',
+                      dynamic_geo_horizon=5.0):
     """Subprocess that owns one CarlaMultiAgentEnv (N agents on 1 server)."""
     signal.signal(signal.SIGINT, signal.SIG_IGN)
 
@@ -485,6 +487,8 @@ def _multi_env_worker(pipe, cfg_dict, port, num_agents, max_speed, fps,
         )
         if not discrete:
             kwargs['use_mpc'] = use_mpc
+            kwargs['dynamic_geo_mode'] = dynamic_geo_mode
+            kwargs['dynamic_geo_horizon'] = dynamic_geo_horizon
         env = EnvClass(**kwargs)
 
     def _safe_reset():
@@ -639,7 +643,9 @@ class VecCarlaMultiAgentEnv:
                  navmesh_cache_dir=None,
                  quadrant_margin=None,
                  randomize_weather=False,
-                 use_mpc=False):
+                 use_mpc=False,
+                 dynamic_geo_reward=False,
+                 dynamic_geo_horizon=5.0):
         from omegaconf import OmegaConf
 
         self.cfg_dict = OmegaConf.to_container(cfg, resolve=True)
@@ -662,6 +668,8 @@ class VecCarlaMultiAgentEnv:
         self.quadrant_margin = quadrant_margin
         self.randomize_weather = randomize_weather
         self.use_mpc = use_mpc
+        self.dynamic_geo_mode = dynamic_geo_mode
+        self.dynamic_geo_horizon = dynamic_geo_horizon
 
         # Server lifecycle management (for autonomous restart)
         self.carla_bin = carla_bin
@@ -699,7 +707,9 @@ class VecCarlaMultiAgentEnv:
                   self.navmesh_cache_dir,
                   self.quadrant_margin,
                   self.randomize_weather,
-                  self.use_mpc),
+                  self.use_mpc,
+                  self.dynamic_geo_mode,
+                  self.dynamic_geo_horizon),
             daemon=True,
         )
         p.start()
