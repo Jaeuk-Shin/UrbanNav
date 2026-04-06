@@ -7,6 +7,10 @@ import signal
 import numpy as np
 import random
 
+from omegaconf import OmegaConf
+from rl.envs.carla import CarlaEnv
+from rl.envs.carla_basic import CarlaBasicEnv
+
 
 # ─── CARLA Server Launcher ───────────────────────────────────────────
 
@@ -32,7 +36,7 @@ def launch_carla_servers(carla_bin, ports, gpu_ids, startup_wait=15,
     Returns a list of Popen handles for cleanup.
     """
     procs = []
-    for i, (port, gpu_id) in enumerate(zip(ports, cycle(gpu_ids))):
+    for port, gpu_id in zip(ports, gpu_ids):
         cmd = [
             carla_bin,
             "-RenderOffScreen",
@@ -84,7 +88,6 @@ def stop_carla_servers(server_procs):
 
 # ─── Vectorized CARLA Environment ────────────────────────────────────
 
-
 def _env_worker(pipe, cfg_dict, port, max_speed, fps, max_episode_steps, gamma, simple_action,
                 teleport=False, towns=None, randomize_weather=False):
     """Subprocess that owns one CarlaEnv and communicates via pipe."""
@@ -97,10 +100,6 @@ def _env_worker(pipe, cfg_dict, port, max_speed, fps, max_episode_steps, gamma, 
     worker_seed = port + os.getpid()
     np.random.seed(worker_seed)
     random.seed(worker_seed)
-
-    from omegaconf import OmegaConf
-    from rl.envs.carla import CarlaEnv
-    from rl.envs.carla_basic import CarlaBasicEnv
 
     MAX_RETRIES = 5
     RETRY_DELAY = 5.0
@@ -437,7 +436,8 @@ def _multi_env_worker(pipe, cfg_dict, port, num_agents, max_speed, fps,
                       randomize_weather=False,
                       use_mpc=False,
                       dynamic_geo_mode='off',
-                      dynamic_geo_horizon=5.0):
+                      dynamic_geo_horizon=5.0,
+                      scenario_dir=None):
     """Subprocess that owns one CarlaMultiAgentEnv (N agents on 1 server)."""
     signal.signal(signal.SIGINT, signal.SIG_IGN)
 
@@ -445,7 +445,6 @@ def _multi_env_worker(pipe, cfg_dict, port, num_agents, max_speed, fps,
     np.random.seed(worker_seed)
     random.seed(worker_seed)
 
-    from omegaconf import OmegaConf
     if discrete:
         from rl.envs.carla_multi_discrete import CarlaMultiAgentDiscreteEnv as EnvClass
     else:
@@ -484,6 +483,7 @@ def _multi_env_worker(pipe, cfg_dict, port, num_agents, max_speed, fps,
             navmesh_cache=navmesh_cache,
             quadrant_margin=quadrant_margin,
             randomize_weather=randomize_weather,
+            scenario_dir=scenario_dir,
         )
         if not discrete:
             kwargs['use_mpc'] = use_mpc
@@ -609,6 +609,31 @@ def _multi_env_worker(pipe, cfg_dict, port, num_agents, max_speed, fps,
                 print(f"[multi-worker port={port}] get_solvability_stats failed: {e}")
                 pipe.send(None)
 
+        elif cmd == "spawn_cctv_cameras":
+            specs, fov, img_size = data
+            try:
+                env.spawn_cctv_cameras(specs, fov=fov, img_size=img_size)
+                pipe.send(True)
+            except Exception as e:
+                print(f"[multi-worker port={port}] spawn_cctv_cameras failed: {e}")
+                pipe.send(False)
+
+        elif cmd == "collect_cctv_frames":
+            try:
+                result = env.collect_cctv_frames()
+                pipe.send(result)
+            except Exception as e:
+                print(f"[multi-worker port={port}] collect_cctv_frames failed: {e}")
+                pipe.send({'frames': {}, 'specs': []})
+
+        elif cmd == "destroy_cctv_cameras":
+            try:
+                env.destroy_cctv_cameras()
+                pipe.send(True)
+            except Exception as e:
+                print(f"[multi-worker port={port}] destroy_cctv_cameras failed: {e}")
+                pipe.send(False)
+
         elif cmd == "close":
             break
 
@@ -625,11 +650,11 @@ def _multi_env_worker(pipe, cfg_dict, port, num_agents, max_speed, fps,
 
 class VecCarlaMultiAgentEnv:
     """
-    Vectorised environment: N CARLA servers x M agents each = N*M rollouts.
+    Vectorised environment: N CARLA servers x M agents each = N x M rollouts.
 
     Each server runs a CarlaMultiAgentEnv with M agents (quadrant split).
     The public interface is identical to VecCarlaEnv: step / reset / close /
-    capture_bev / set_collect_substep_frames, with num_envs = N * M.
+    capture_bev / set_collect_substep_frames, with num_envs = N x M.
     """
 
     def __init__(self, cfg, ports, num_agents_per_server=4,
@@ -644,9 +669,9 @@ class VecCarlaMultiAgentEnv:
                  quadrant_margin=None,
                  randomize_weather=False,
                  use_mpc=False,
-                 dynamic_geo_reward=False,
-                 dynamic_geo_horizon=5.0):
-        from omegaconf import OmegaConf
+                 dynamic_geo_mode='off',
+                 dynamic_geo_horizon=5.0,
+                 scenario_dir=None):
 
         self.cfg_dict = OmegaConf.to_container(cfg, resolve=True)
         self.ports = ports
@@ -670,6 +695,7 @@ class VecCarlaMultiAgentEnv:
         self.use_mpc = use_mpc
         self.dynamic_geo_mode = dynamic_geo_mode
         self.dynamic_geo_horizon = dynamic_geo_horizon
+        self.scenario_dir = scenario_dir
 
         # Server lifecycle management (for autonomous restart)
         self.carla_bin = carla_bin
@@ -709,7 +735,8 @@ class VecCarlaMultiAgentEnv:
                   self.randomize_weather,
                   self.use_mpc,
                   self.dynamic_geo_mode,
-                  self.dynamic_geo_horizon),
+                  self.dynamic_geo_horizon,
+                  self.scenario_dir),
             daemon=True,
         )
         p.start()
@@ -923,9 +950,9 @@ class VecCarlaMultiAgentEnv:
         Parameters
         ----------
         specs : list of dict, each with keys
-            ``env_idx``   – flat env index (for routing to the correct server)
-            ``center_xz`` – (2,) standard world coords
-            ``altitude``  – float, metres
+            ``env_idx``   - flat env index (for routing to the correct server)
+            ``center_xz`` - (2,) standard world coords
+            ``altitude``  - float, metres
         fov, img_size : camera parameters
 
         Returns
@@ -1013,6 +1040,8 @@ class VecCarlaMultiAgentEnv:
             'solvable_episodes': 0,
             'unsolvable_episodes': 0,
             'goal_retries_total': 0,
+            'obstacle_spawn_requested': 0,
+            'obstacle_spawn_failed': 0,
         }
         for i in range(self.num_servers):
             try:
@@ -1021,6 +1050,10 @@ class VecCarlaMultiAgentEnv:
                     agg['solvable_episodes'] += stats['solvable_episodes']
                     agg['unsolvable_episodes'] += stats['unsolvable_episodes']
                     agg['goal_retries_total'] += stats['goal_retries_total']
+                    agg['obstacle_spawn_requested'] += stats.get(
+                        'obstacle_spawn_requested', 0)
+                    agg['obstacle_spawn_failed'] += stats.get(
+                        'obstacle_spawn_failed', 0)
             except (EOFError, BrokenPipeError, OSError):
                 pass
 
@@ -1029,7 +1062,87 @@ class VecCarlaMultiAgentEnv:
             agg['unsolvable_episodes'] / total if total > 0 else 0.0)
         agg['mean_goal_retries'] = (
             agg['goal_retries_total'] / total if total > 0 else 0.0)
+        obs_req = agg['obstacle_spawn_requested']
+        agg['obstacle_spawn_fail_rate'] = (
+            agg['obstacle_spawn_failed'] / obs_req if obs_req > 0 else 0.0)
         return agg
+
+    # ── CCTV cameras ────────────────────────────────────────────────────
+
+    def spawn_cctv_cameras(self, all_specs, fov=90.0, img_size=512):
+        """Spawn persistent CCTV cameras on each server.
+
+        Parameters
+        ----------
+        all_specs : list of dict
+            Each dict has ``agent_idx`` (flat env index) and camera placement
+            fields.  Specs are grouped by server automatically.
+        fov, img_size : camera parameters
+        """
+        M = self.agents_per_server
+        server_specs = {}
+        for spec in all_specs:
+            server_idx = spec['agent_idx'] // M
+            worker_spec = {**spec, 'agent_idx': spec['agent_idx'] % M}
+            server_specs.setdefault(server_idx, []).append(worker_spec)
+
+        for server_idx in range(self.num_servers):
+            specs = server_specs.get(server_idx, [])
+            try:
+                self.pipes[server_idx].send((
+                    "spawn_cctv_cameras", (specs, fov, img_size)))
+            except (BrokenPipeError, OSError):
+                pass
+
+        for server_idx in range(self.num_servers):
+            if server_idx in server_specs or True:
+                try:
+                    self.pipes[server_idx].recv()
+                except (EOFError, BrokenPipeError, OSError):
+                    pass
+
+    def collect_cctv_frames(self):
+        """Collect accumulated CCTV frames from all servers.
+
+        Returns dict mapping flat env_idx -> (T, H, W, 3) uint8 or None,
+        plus list of spec dicts with flat env indices.
+        """
+        M = self.agents_per_server
+
+        for i in range(self.num_servers):
+            try:
+                self.pipes[i].send(("collect_cctv_frames", None))
+            except (BrokenPipeError, OSError):
+                pass
+
+        flat_frames = {}
+        all_specs = []
+        for server_idx in range(self.num_servers):
+            try:
+                result = self.pipes[server_idx].recv()
+                for local_aidx, arr in result['frames'].items():
+                    flat_idx = server_idx * M + local_aidx
+                    flat_frames[flat_idx] = arr
+                for spec in result['specs']:
+                    flat_spec = {**spec, 'agent_idx': server_idx * M + spec['agent_idx']}
+                    all_specs.append(flat_spec)
+            except (EOFError, BrokenPipeError, OSError):
+                pass
+
+        return {'frames': flat_frames, 'specs': all_specs}
+
+    def destroy_cctv_cameras(self):
+        """Destroy CCTV cameras on all servers."""
+        for i in range(self.num_servers):
+            try:
+                self.pipes[i].send(("destroy_cctv_cameras", None))
+            except (BrokenPipeError, OSError):
+                pass
+        for i in range(self.num_servers):
+            try:
+                self.pipes[i].recv()
+            except (EOFError, BrokenPipeError, OSError):
+                pass
 
     def close(self):
         for i in range(self.num_servers):

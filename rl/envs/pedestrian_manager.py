@@ -6,22 +6,22 @@ social force model.  Unlike CARLA's built-in AI walker controller, this
 handles dynamically spawned obstacles that are absent from the navmesh.
 
 Forces applied per pedestrian:
-  - Desired    : drives toward a navmesh-sampled destination
+  - Desired    : drives toward the next waypoint along a Detour navmesh path
   - Ped–ped    : repulsion from other pedestrians
   - Obstacle   : repulsion from spawned static obstacles
-  - Boundary   : repulsion from walkable-region edges (punctured mesh)
   - NO ego     : the RL agent must learn to avoid pedestrians itself
 
-Boundary constraint
-~~~~~~~~~~~~~~~~~~~
-When ``set_walkable_mesh()`` is called with navmesh triangles and obstacle
-bounding boxes, the manager "punctures" the walkable mesh by removing
-triangles that overlap with obstacle geometry.  Boundary edges of the
-remaining mesh are extracted and used to generate repulsion forces that
-keep pedestrians within walkable regions and away from obstacle interiors.
+Detour navmesh pathfinding
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+When a Detour ``.bin`` navmesh is available, the desired force follows a
+sidewalk-only path computed by the C++ Detour extension.  Pedestrians
+navigate through intermediate waypoints and only cross roads at
+crosswalks.  When Detour is unavailable, falls back to straight-line
+desired force (original behaviour).
 """
 
 import math
+import os
 import random
 from collections import deque
 from dataclasses import dataclass
@@ -30,8 +30,6 @@ from typing import List, Optional, Tuple
 import numpy as np
 
 import carla
-
-from rl.utils.mesh_utils import puncture_triangles
 
 
 # ── Config ────────────────────────────────────────────────────────────
@@ -52,12 +50,9 @@ class PedestrianConfig:
     B_obs: float = 0.2           # obstacle repulsion range (m)
     ped_radius: float = 0.3      # body radius (m)
 
-    # Boundary (walkable-region edge) repulsion
-    A_boundary: float = 5.0          # boundary repulsion strength
-    B_boundary: float = 0.5          # boundary repulsion range (m)
-
     # Navigation
     dest_reach_threshold: float = 2.0   # resample when this close (m)
+    waypoint_advance_threshold: float = 1.5  # advance to next waypoint (m)
     interaction_radius: float = 5.0     # ignore forces beyond this (m)
 
 
@@ -66,7 +61,7 @@ class PedestrianConfig:
 
 class _Pedestrian:
     __slots__ = ("actor", "desired_speed", "region_idx", "destination_ue",
-                 "_traj_buf")
+                 "_traj_buf", "_waypoints_ue", "_wp_idx")
 
     _TRAJ_MAXLEN = 200   # keep last N positions for visualisation
 
@@ -76,6 +71,8 @@ class _Pedestrian:
         self.region_idx = region_idx
         self.destination_ue: Optional[np.ndarray] = None   # (3,) UE xyz
         self._traj_buf: deque = deque(maxlen=_Pedestrian._TRAJ_MAXLEN)
+        self._waypoints_ue: Optional[np.ndarray] = None    # (W, 3) Detour path
+        self._wp_idx: int = 0
 
 
 # ── Manager ───────────────────────────────────────────────────────────
@@ -87,8 +84,8 @@ class PedestrianManager:
     Lifecycle::
 
         mgr = PedestrianManager(config)
-        mgr.initialize(world, bp_lib, quadrant_bounds)   # spawns walkers
-        mgr.set_walkable_mesh(tris_std, obstacle_corners) # boundary constraint
+        mgr.initialize(world, bp_lib, quadrant_bounds,
+                        obstacle_layout=obstacle_layout)  # loads Detour, spawns
         # each simulation tick:
         mgr.update(dt, obstacle_positions_ue)             # SFM step
         world.tick()
@@ -105,15 +102,23 @@ class PedestrianManager:
         self.pedestrians: List[_Pedestrian] = []
         self._navmesh_cache = None
         self._current_town = None
-        # Boundary constraint (populated by set_walkable_mesh)
-        self._boundary_edges_ue: Optional[np.ndarray] = None   # (E, 2, 2)
-        self._boundary_normals_ue: Optional[np.ndarray] = None  # (E, 2)
+        # Detour navmesh pathfinder (populated by initialize())
+        self._detour = None
 
     # ── Lifecycle ─────────────────────────────────────────────────────
 
     def initialize(self, world, bp_lib, quadrant_bounds,
-                   navmesh_cache=None, town=None):
-        """Spawn pedestrians.  Call once after map load + region split."""
+                   navmesh_cache=None, town=None,
+                   obstacle_layout=None):
+        """Spawn pedestrians.  Call once after map load + region split.
+
+        Parameters
+        ----------
+        obstacle_layout : dict or None
+            From ``ObstacleManager.get_obstacle_layout()``.  When provided
+            together with a Detour navmesh, obstacle polygons are blocked
+            so pedestrian paths route around them.
+        """
         if not self.enabled:
             return
         self._navmesh_cache = navmesh_cache
@@ -121,6 +126,14 @@ class PedestrianManager:
         self.world = world
         self.bp_lib = bp_lib
         self.quadrant_bounds = quadrant_bounds
+
+        # Load Detour navmesh pathfinder (optional)
+        self._detour = self._load_detour()
+
+        # Block navmesh polygons under obstacles before spawning
+        if obstacle_layout is not None:
+            self._block_obstacle_polygons(obstacle_layout)
+
         self._spawn_all()
 
     def clear_all(self, client):
@@ -134,185 +147,131 @@ class PedestrianManager:
             print(f"  [PedestrianManager] clear_all error: {e}")
         self.pedestrians.clear()
 
-    # ── Walkable-mesh boundary constraint ─────────────────────────────
+    # ── Detour navmesh integration ────────────────────────────────────
 
-    def set_walkable_mesh(self, walkable_tris_std: np.ndarray,
-                          obstacle_corners_std: Optional[List[np.ndarray]] = None):
-        """Build boundary edges from a punctured walkable mesh.
+    def _load_detour(self):
+        """Try to load a Detour pathfinder for sidewalk-only pathfinding.
 
-        Call after obstacles are spawned to enable boundary constraints.
-        Triangles overlapping with obstacle bounding boxes are removed
-        ("punctured") and boundary edges of the remaining mesh produce
-        inward-pointing repulsion forces during ``update()``.
-
-        Parameters
-        ----------
-        walkable_tris_std : (N, 3, 2)
-            Walkable navmesh triangles in standard 2D coords (x_std, z_std).
-        obstacle_corners_std : list of (4, 2) ndarrays, optional
-            Oriented bounding-box corners per obstacle in standard coords.
+        Uses the navmesh cache directory to find ``.bin`` files.
+        Returns a ``DetourPathfinder`` or ``None``.
         """
-        if not self.enabled:
+        if self._navmesh_cache is None or self._current_town is None:
+            return None
+        cache_dir = self._navmesh_cache.cache_dir
+        if cache_dir is None:
+            return None
+
+        try:
+            import detour_nav
+        except ImportError:
+            print("  [PedestrianManager] detour_nav not built — "
+                  "using straight-line fallback. "
+                  "Build with: cd detour_nav && bash build.sh")
+            return None
+
+        bin_path = os.path.join(cache_dir, f"{self._current_town}.bin")
+        if not os.path.exists(bin_path):
+            print(f"  [PedestrianManager] No .bin navmesh for "
+                  f"{self._current_town} in {cache_dir}")
+            return None
+
+        pf = detour_nav.DetourPathfinder()
+        if not pf.load(bin_path):
+            print(f"  [PedestrianManager] Failed to load {bin_path}")
+            return None
+
+        pf.set_sidewalk_only()
+        print(f"  [PedestrianManager] Detour loaded: "
+              f"{self._current_town}.bin — sidewalk-only paths")
+        return pf
+
+    def _block_obstacle_polygons(self, obstacle_layout: dict):
+        """Block navmesh polygons under spawned obstacles.
+
+        Call after obstacles are spawned so Detour paths route around them.
+        """
+        if self._detour is None:
             return
+        self._detour.unblock_all()
 
-        n_before = walkable_tris_std.shape[0]
+        total_blocked = 0
+        margin = self.config.ped_radius
+        for obs in obstacle_layout.get('obstacles', []):
+            corners_std = obs['corners_std']         # (4, 2) standard frame
+            corners_ue = corners_std[:, ::-1].copy()  # std → UE: swap columns
 
-        # Convert standard → UE: (x_std, z_std) → (ue_x=z_std, ue_y=x_std)
-        tris_ue = walkable_tris_std[:, :, ::-1].copy()
+            ue_x_min, ue_x_max = corners_ue[:, 0].min(), corners_ue[:, 0].max()
+            ue_y_min, ue_y_max = corners_ue[:, 1].min(), corners_ue[:, 1].max()
 
-        # Puncture: remove triangles overlapping with obstacle OBBs
-        if obstacle_corners_std:
-            obbs_ue = [c[:, ::-1].copy() for c in obstacle_corners_std]
-            tris_ue = puncture_triangles(tris_ue, obbs_ue,
-                                         buffer=self.config.ped_radius)
+            # AABB centre + half-extents in Recast frame
+            cx = (ue_x_min + ue_x_max) / 2
+            cz = (ue_y_min + ue_y_max) / 2
+            cy = 0.0                                  # ground level
+            half_ex = (ue_x_max - ue_x_min) / 2 + margin
+            half_ey = 4.0                             # generous vertical
+            half_ez = (ue_y_max - ue_y_min) / 2 + margin
 
-        if tris_ue.shape[0] == 0:
-            self._boundary_edges_ue = None
-            self._boundary_normals_ue = None
-            return
+            # UE → Recast: (ue_x, ue_z, ue_y)
+            total_blocked += self._detour.block_polygons_in_aabb(
+                cx, cy, cz, half_ex, half_ey, half_ez)
 
-        # Extract boundary edges and inward normals
-        edges, normals = self._extract_boundary(tris_ue)
+        if total_blocked > 0:
+            print(f"  [PedestrianManager] Blocked {total_blocked} navmesh "
+                  f"polygons under obstacles")
 
-        # Filter to edges within the active quadrant region (+ margin)
-        if self.quadrant_bounds and edges.shape[0] > 0:
-            margin = self.config.interaction_radius
-            xlo = min(b[0] for b in self.quadrant_bounds) - margin
-            xhi = max(b[1] for b in self.quadrant_bounds) + margin
-            ylo = min(b[2] for b in self.quadrant_bounds) - margin
-            yhi = max(b[3] for b in self.quadrant_bounds) + margin
-            mids = (edges[:, 0] + edges[:, 1]) / 2
-            keep = ((mids[:, 0] >= xlo) & (mids[:, 0] <= xhi)
-                    & (mids[:, 1] >= ylo) & (mids[:, 1] <= yhi))
-            edges = edges[keep]
-            normals = normals[keep]
+    def _compute_detour_path(self, ped: _Pedestrian) -> bool:
+        """Compute a Detour sidewalk path from current position to destination.
 
-        self._boundary_edges_ue = edges
-        self._boundary_normals_ue = normals
-
-        n_punctured = n_before - tris_ue.shape[0]
-        print(f"  [PedestrianManager] Walkable mesh: {n_before} tris, "
-              f"{n_punctured} punctured, {edges.shape[0]} boundary edges")
-
-    @staticmethod
-    def _extract_boundary(tris_ue: np.ndarray):
-        """Extract boundary edges and inward normals from a triangle mesh.
-
-        Boundary edges appear in exactly one triangle.  The inward normal
-        points toward the triangle interior (the opposite vertex).
-
-        Parameters
-        ----------
-        tris_ue : (N, 3, 2) — triangles in UE (ue_x, ue_y)
-
-        Returns
-        -------
-        edges   : (E, 2, 2) — boundary edge endpoint pairs
-        normals : (E, 2)    — unit inward normals
+        Stores waypoints on ``ped._waypoints_ue`` and resets ``ped._wp_idx``.
+        Returns True if a valid path was found.
         """
-        PREC = 3   # quantise to 1 mm for edge key stability
+        if self._detour is None or ped.destination_ue is None:
+            ped._waypoints_ue = None
+            return False
 
-        edge_count: dict = {}
-        edge_data: dict = {}
+        loc = ped.actor.get_location()
+        dest = ped.destination_ue
 
-        N = tris_ue.shape[0]
-        for t in range(N):
-            v = tris_ue[t]                             # (3, 2)
-            for i in range(3):
-                j = (i + 1) % 3
-                k = 3 - i - j                          # opposite vertex
+        # UE (x, y, z) → Recast (x, z, y)
+        sx, sy, sz = float(loc.x), float(loc.z), float(loc.y)
+        ex, ey, ez = float(dest[0]), float(dest[2]), float(dest[1])
 
-                key_a = tuple(np.round(v[i], PREC).tolist())
-                key_b = tuple(np.round(v[j], PREC).tolist())
-                edge_key = (min(key_a, key_b), max(key_a, key_b))
+        dist, waypoints = self._detour.find_path(sx, sy, sz, ex, ey, ez)
 
-                edge_count[edge_key] = edge_count.get(edge_key, 0) + 1
-                if edge_count[edge_key] == 1:
-                    # Store geometry only on first encounter
-                    edge_data[edge_key] = (v[i].copy(), v[j].copy(),
-                                           v[k].copy())
+        if math.isinf(dist) or len(waypoints) < 2:
+            ped._waypoints_ue = None
+            return False
 
-        boundary_edges = []
-        boundary_normals = []
+        # Recast (rx, ry, rz) → UE (rx, rz, ry)
+        wps_ue = np.array([[wp[0], wp[2], wp[1]] for wp in waypoints])
+        ped._waypoints_ue = wps_ue
+        ped._wp_idx = 1   # skip start point (current position)
+        return True
 
-        for edge_key, count in edge_count.items():
-            if count != 1:
-                continue
-            a, b, opp = edge_data[edge_key]
+    def _get_desired_target_ue_2d(self, ped: _Pedestrian,
+                                  pos_ue_2d: np.ndarray) -> np.ndarray:
+        """Return the 2D UE (ue_x, ue_y) point the pedestrian should steer toward.
 
-            edge_dir = b - a
-            # Perpendicular (90° CCW rotation)
-            n_candidate = np.array([-edge_dir[1], edge_dir[0]])
-
-            # Choose the direction pointing toward the opposite vertex
-            mid = (a + b) * 0.5
-            if np.dot(n_candidate, opp - mid) < 0:
-                n_candidate = -n_candidate
-
-            norm_len = np.linalg.norm(n_candidate)
-            if norm_len < 1e-8:
-                continue
-            n_candidate /= norm_len
-
-            boundary_edges.append((a, b))
-            boundary_normals.append(n_candidate)
-
-        if not boundary_edges:
-            return np.empty((0, 2, 2)), np.empty((0, 2))
-
-        return np.array(boundary_edges), np.array(boundary_normals)
-
-    def _compute_boundary_force(self, positions: np.ndarray) -> np.ndarray:
-        """Vectorised boundary repulsion for all pedestrians.
-
-        For each pedestrian, finds the distance to every boundary edge
-        (nearest point on the segment) and applies an exponential
-        repulsion force along the edge's inward normal.
-
-        Parameters
-        ----------
-        positions : (n, 2) — pedestrian positions in UE
-
-        Returns
-        -------
-        (n, 2) — boundary repulsion forces
+        Follows Detour waypoints if available, otherwise straight-line to dest.
         """
-        if (self._boundary_edges_ue is None
-                or self._boundary_normals_ue is None
-                or self._boundary_edges_ue.shape[0] == 0):
-            return np.zeros_like(positions)
+        # Straight-line fallback
+        if ped._waypoints_ue is None or ped._wp_idx >= len(ped._waypoints_ue):
+            if ped.destination_ue is not None:
+                return ped.destination_ue[:2]
+            return pos_ue_2d  # no destination — stay in place
 
         cfg = self.config
-        edges = self._boundary_edges_ue       # (E, 2, 2)
-        normals = self._boundary_normals_ue   # (E, 2)
+        wp = ped._waypoints_ue[ped._wp_idx, :2]   # 2D UE
+        dist = np.linalg.norm(pos_ue_2d - wp)
 
-        a = edges[:, 0, :]                     # (E, 2) edge start
-        b = edges[:, 1, :]                     # (E, 2) edge end
-        ab = b - a                             # (E, 2)
-        ab_len_sq = (ab ** 2).sum(axis=1)      # (E,)
-        ab_len_sq = np.maximum(ab_len_sq, 1e-10)
+        if dist < cfg.waypoint_advance_threshold:
+            ped._wp_idx += 1
+            if ped._wp_idx >= len(ped._waypoints_ue):
+                # Reached end of path — target final destination
+                return ped.destination_ue[:2]
+            wp = ped._waypoints_ue[ped._wp_idx, :2]
 
-        # Vector from a to each position: (n, E, 2)
-        ap = positions[:, None, :] - a[None, :, :]
-
-        # Project onto segment, clamp to [0, 1]
-        t = (ap * ab[None, :, :]).sum(axis=2) / ab_len_sq[None, :]   # (n, E)
-        t = np.clip(t, 0.0, 1.0)
-
-        # Closest point on each edge
-        closest = a[None, :, :] + t[:, :, None] * ab[None, :, :]     # (n,E,2)
-
-        # Distance from pedestrian to closest point
-        diff = positions[:, None, :] - closest                        # (n,E,2)
-        dist = np.linalg.norm(diff, axis=2)                           # (n, E)
-
-        # Exponential repulsion, masked by interaction radius
-        mask = dist < cfg.interaction_radius
-        mag = cfg.A_boundary * np.exp(-dist / cfg.B_boundary) * mask  # (n, E)
-
-        # Sum forces along inward normals over all edges
-        f_boundary = (mag[:, :, None] * normals[None, :, :]).sum(axis=1)
-        return f_boundary                                              # (n, 2)
+        return wp
 
     # ── Spawning ──────────────────────────────────────────────────────
 
@@ -324,6 +283,7 @@ class PedestrianManager:
             return
 
         num_regions = len(self.quadrant_bounds)
+        n_detour_paths = 0
         for region_idx in range(num_regions):
             bounds = self.quadrant_bounds[region_idx]
             for _ in range(cfg.num_per_region):
@@ -346,11 +306,16 @@ class PedestrianManager:
                 dest = self._sample_navmesh_in_bounds(bounds)
                 if dest is not None:
                     ped.destination_ue = np.array([dest.x, dest.y, dest.z])
+                    if self._compute_detour_path(ped):
+                        n_detour_paths += 1
 
                 self.pedestrians.append(ped)
 
         print(f"  [PedestrianManager] Spawned {len(self.pedestrians)} "
               f"SFM pedestrians ({cfg.num_per_region}/region)")
+        if self._detour is not None:
+            print(f"  [PedestrianManager] {n_detour_paths}/"
+                  f"{len(self.pedestrians)} initial Detour paths computed")
 
     # ── SFM update (vectorised) ───────────────────────────────────────
 
@@ -394,11 +359,15 @@ class PedestrianManager:
                 if ped.destination_ue is not None:
                     destinations[i] = ped.destination_ue[:2]
 
-        # -- 1. desired force: (v0 * e_d − v) / τ --
-        diff_dest = destinations - positions                         # (n, 2)
-        d2d = np.linalg.norm(diff_dest, axis=1, keepdims=True)      # (n, 1)
-        d2d = np.maximum(d2d, 1e-6)
-        e_d = diff_dest / d2d                                        # (n, 2)
+        # -- 1. desired force toward waypoint target: (v0 * e_d − v) / τ --
+        targets = np.zeros((n, 2))
+        for i, ped in enumerate(self.pedestrians):
+            targets[i] = self._get_desired_target_ue_2d(ped, positions[i])
+
+        diff_target = targets - positions
+        d2t = np.linalg.norm(diff_target, axis=1, keepdims=True)
+        d2t = np.maximum(d2t, 1e-6)
+        e_d = diff_target / d2t
         f_desired = (desired_speeds[:, None] * e_d - velocities) / cfg.tau
 
         # -- 2. ped–ped repulsion --
@@ -426,11 +395,8 @@ class PedestrianManager:
             mag_po = cfg.A_obs * np.exp(-dist_po / cfg.B_obs) * mask_po
             f_obs = (mag_po[:, :, None] * n_po).sum(axis=1)         # (n, 2)
 
-        # -- 4. boundary repulsion (punctured walkable mesh) --
-        f_boundary = self._compute_boundary_force(positions)
-
         # -- velocity integration + clamping --
-        f_total = f_desired + f_ped + f_obs + f_boundary
+        f_total = f_desired + f_ped + f_obs
         new_vel = velocities + f_total * dt
 
         speeds = np.linalg.norm(new_vel, axis=1)
@@ -507,8 +473,9 @@ class PedestrianManager:
         CARLA actors — uses current actor state as initial conditions and
         integrates forward for *horizon_steps* steps.
 
-        When a simulated pedestrian reaches its destination it decelerates
-        in place (we cannot sample a new navmesh destination without CARLA).
+        Uses the current Detour waypoint target as the desired direction
+        for the entire prediction horizon (a good approximation for short
+        horizons since waypoints represent straight segments).
 
         Parameters
         ----------
@@ -534,15 +501,15 @@ class PedestrianManager:
         # -- gather initial state from CARLA actors --
         pos = np.zeros((n, 2))
         vel = np.zeros((n, 2))
-        dests = np.zeros((n, 2))
+        targets = np.zeros((n, 2))
         speeds = np.zeros(n)
         for i, ped in enumerate(self.pedestrians):
             loc = ped.actor.get_location()
             pos[i] = (loc.x, loc.y)
             v = ped.actor.get_velocity()
             vel[i] = (v.x, v.y)
-            if ped.destination_ue is not None:
-                dests[i] = ped.destination_ue[:2]
+            # Use current waypoint target (peek without advancing)
+            targets[i] = self._peek_desired_target_ue_2d(ped, pos[i])
             speeds[i] = ped.desired_speed
 
         # -- forward simulate --
@@ -551,13 +518,13 @@ class PedestrianManager:
             out[t] = pos
 
             # destination reached → decelerate in place
-            d2d_vec = dests - pos
-            d2d = np.linalg.norm(d2d_vec, axis=1, keepdims=True)
-            d2d = np.maximum(d2d, 1e-6)
-            arrived = (d2d.squeeze(1) < cfg.dest_reach_threshold)
+            d2t_vec = targets - pos
+            d2t = np.linalg.norm(d2t_vec, axis=1, keepdims=True)
+            d2t = np.maximum(d2t, 1e-6)
+            arrived = (d2t.squeeze(1) < cfg.dest_reach_threshold)
 
             # 1. desired force
-            e_d = d2d_vec / d2d
+            e_d = d2t_vec / d2t
             f_desired = (speeds[:, None] * e_d - vel) / cfg.tau
             f_desired[arrived] = -vel[arrived] / cfg.tau
 
@@ -583,11 +550,8 @@ class PedestrianManager:
                 mag_po = cfg.A_obs * np.exp(-dist_po / cfg.B_obs) * mask_po
                 f_obs = (mag_po[:, :, None] * n_po).sum(axis=1)
 
-            # 4. boundary repulsion (reuse precomputed edges)
-            f_boundary = self._compute_boundary_force(pos)
-
             # integrate
-            f_total = f_desired + f_ped + f_obs + f_boundary
+            f_total = f_desired + f_ped + f_obs
             vel = vel + f_total * dt
             spd = np.linalg.norm(vel, axis=1)
             too_fast = spd > cfg.max_speed
@@ -614,11 +578,26 @@ class PedestrianManager:
 
     # ── Helpers ───────────────────────────────────────────────────────
 
+    def _peek_desired_target_ue_2d(self, ped: _Pedestrian,
+                                   pos_ue_2d: np.ndarray) -> np.ndarray:
+        """Like ``_get_desired_target_ue_2d`` but never advances waypoint index.
+
+        Used by ``predict_trajectories_std`` to snapshot the current target
+        without side effects.
+        """
+        if ped._waypoints_ue is None or ped._wp_idx >= len(ped._waypoints_ue):
+            if ped.destination_ue is not None:
+                return ped.destination_ue[:2]
+            return pos_ue_2d
+        return ped._waypoints_ue[ped._wp_idx, :2]
+
     def _resample_destination(self, ped: _Pedestrian):
         bounds = self.quadrant_bounds[ped.region_idx]
         loc = self._sample_navmesh_in_bounds(bounds)
         if loc is not None:
             ped.destination_ue = np.array([loc.x, loc.y, loc.z])
+            if not self._compute_detour_path(ped):
+                ped._waypoints_ue = None
 
     def _sample_navmesh_in_bounds(self, bounds,
                                   max_attempts=50,

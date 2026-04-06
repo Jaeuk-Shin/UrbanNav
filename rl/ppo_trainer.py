@@ -39,11 +39,12 @@ from rl.utils.carla_manager import VecCarlaEnv, VecCarlaMultiAgentEnv, launch_ca
 from rl.ppo_agent import PPOAgent
 from rl.goal_only_agent import GoalOnlyMLPAgent
 from rl.utils.vis import (visualize, compute_bev_specs,
-                          compute_episode_bev_specs, log_complete_episode_bev,
                           log_obstacle_bev_figure,
                           log_geodesic_field,
-                          WeatherTracker, log_weather_distributions)
-from rl.utils.logger import log_metrics, EpisodeTracker, EpisodeTrajectoryAccumulator
+                          compute_cctv_specs, log_cctv_video_grid,
+                          WeatherTracker, log_weather_distributions,
+                          GeodesicTracker, log_geodesic_distributions)
+from rl.utils.logger import log_metrics, log_eval_metrics, EpisodeTracker
 from rl.utils.buffer import RolloutBuffers, compute_gae
 from rl.utils.timer import StepTimer
 
@@ -90,6 +91,8 @@ def ppo_update(agent, optimizer, batch, args, num_steps, num_envs,
     correctly resets LSTM hidden state at episode boundaries within
     each rollout.
     """
+
+    # freeze encoder & decoder; only train LSTM & goal MLP 
     agent.train()
     if hasattr(agent, 'obs_encoder'):
         agent.obs_encoder.eval()
@@ -106,6 +109,7 @@ def ppo_update(agent, optimizer, batch, args, num_steps, num_envs,
     stopped_epoch = args.num_epochs
 
     for epoch in range(args.num_epochs):
+        # update policy until meeting the stopping criterion
         np.random.shuffle(envinds)
         kl_exceeded = False
         for start in range(0, num_envs, envsperbatch):
@@ -316,6 +320,7 @@ def train(args):
         use_mpc=args.use_mpc,
         dynamic_geo_mode=args.dynamic_geo_mode,
         dynamic_geo_horizon=args.dynamic_geo_horizon,
+        scenario_dir=args.scenario_dir,
     )
 
     # num_envs = total rollout slots (servers × agents_per_server),
@@ -412,25 +417,21 @@ def train(args):
 
     # ── episode tracker ──
     ep_tracker = EpisodeTracker(num_envs)
-    ep_accum = EpisodeTrajectoryAccumulator(num_envs)
 
     # ── kick off ──
     obs_dict, initial_infos = vec_env.reset()
-    ep_accum.set_initial_spawns(obs_dict['cord'])
     lstm_state = agent.get_initial_lstm_state(num_envs, device)
     global_step = 0
     best_reward = -float("inf")
 
-    # ── weather tracking ──
+    # ── weather & geodesic tracking ──
     weather_tracker = WeatherTracker(num_envs)
     weather_tracker.update(initial_infos)
+    geodesic_tracker = GeodesicTracker(num_envs)
+    geodesic_tracker.update(initial_infos)
 
     # per-env rolling action history (flat vector)
     action_hist = np.zeros((num_envs, action_history_dim), dtype=np.float32)
-
-    # per-env BEV images + metadata captured just before each vis rollout
-    bev_images = [None] * num_envs
-    bev_metas  = [None] * num_envs
 
     n_trainable = sum(p.numel() for p in agent.trainable_parameters())
     print(
@@ -444,6 +445,11 @@ def train(args):
 
     try:
         for iteration in range(1, args.num_iterations + 1):
+            # main loop
+            # N x T steps per iteration, where 
+            #     N: # of episodes
+            #     T: rollout length (= num_steps)
+            # Note that T != episode length; an episode may be terminated (even multiple times) within a single rollout   
             t0 = time.time()
             timer.reset()
 
@@ -453,21 +459,38 @@ def train(args):
                 for pg in optimizer.param_groups:
                     pg["lr"] = frac * args.lr
 
-            # ── capture overhead BEV image before this rollout ──────────
-            # Obstacle/agent layouts are fetched first so that the
-            # auto-altitude computation can include geodesic paths.
-            is_vis_iter = args.vis_every > 0 and iteration % args.vis_every == 0
-            obstacle_layouts = None
+            is_vis_iter = (args.vis_every > 0 and iteration % args.vis_every == 0)
+            is_vis_iter = is_vis_iter or (iteration == 1)   # always visualize the first iteration
+
+            # ════════════════════════════════════════════════════
+            # ── EVALUATION PHASE (vis iterations only) ─────────
+            # ════════════════════════════════════════════════════
+            # Run dedicated eval episodes from a clean reset.
+            # Data is stored in bufs (overwritten by the subsequent
+            # training rollout) and consumed for vis before training.
+            eval_stats = None
             if is_vis_iter:
-                vec_env.set_collect_substep_frames(True)
-                # Snapshot obstacle/pedestrian/agent layout NOW (before the
-                # rollout moves agents) so ego/goal positions match the BEV.
+                _eval_t0 = time.time()
+                _phase_t = time.time()
+                obs_dict, eval_infos = vec_env.reset()
+                _eval_reset_time = time.time() - _phase_t
+                eval_lstm = agent.get_initial_lstm_state(num_envs, device)
+                eval_action_hist = np.zeros((num_envs, action_history_dim),
+                                            dtype=np.float32)
+
+                # Snapshot obstacle/pedestrian/agent layout after reset
+                obstacle_layouts = None
                 try:
                     obstacle_layouts = vec_env.get_obstacle_layouts()
                 except Exception as e:
                     print(f"  [BEV-obstacle] layout query failed: {e}")
                     obstacle_layouts = None
-                # Auto-altitude BEV capture (start + goal + geodesic)
+
+                # BEV capture (start + goal + geodesic auto-altitude)
+                _phase_t = time.time()
+                bev_images = [None] * num_envs
+                bev_metas = [None] * num_envs
+                vec_env.set_collect_substep_frames(True)
                 try:
                     _bev_specs = compute_bev_specs(
                         obs_dict['cord'],
@@ -486,12 +509,272 @@ def train(args):
                             bev_images[i], bev_metas[i] = result
                 except Exception as e:
                     print(f"  [BEV] capture failed: {e}")
-            # per-env list of substep frame lists (only populated on vis iterations)
-            substep_frames = [[] for _ in range(num_envs)] if is_vis_iter else None
-            # per-env MPC/policy vis data (only on vis iterations)
-            mpc_vis_data = [[] for _ in range(num_envs)] if is_vis_iter else None
 
-            # ── rollout collection ──
+                _bev_init_time = time.time() - _phase_t
+
+                substep_frames = [[] for _ in range(num_envs)]
+                mpc_vis_data = [[] for _ in range(num_envs)]
+                ped_positions = [[] for _ in range(num_envs)]
+
+                # CCTV cameras (persistent for eval rollout)
+                _phase_t = time.time()
+                try:
+                    _cctv_specs = compute_cctv_specs(
+                        obs_dict['cord'],
+                        obs_dict.get('goal_world', obs_dict['goal']),
+                        obstacle_layouts=obstacle_layouts,
+                    )
+                    if _cctv_specs:
+                        vec_env.spawn_cctv_cameras(
+                            _cctv_specs, fov=90.0, img_size=512)
+                except Exception as e:
+                    print(f"  [CCTV] camera spawn failed: {e}")
+
+                _cctv_spawn_time = time.time() - _phase_t
+
+                # ── eval rollout ──
+                _phase_t = time.time()
+                eval_tracker = EpisodeTracker(num_envs)
+                agent.eval()
+                if not use_goal_only:
+                    agent.obs_encoder.eval()
+                    if args.use_decoder:
+                        agent.action_decoder.eval()
+
+                for step in range(num_steps):
+                    bufs.obs[step] = obs_dict["obs"]
+                    bufs.cord[step] = obs_dict["cord"]
+                    bufs.goal[step] = obs_dict["goal"]
+                    bufs.goal_world[step] = obs_dict.get(
+                        "goal_world", obs_dict["goal"])
+
+                    with torch.no_grad():
+                        goal_t = torch.as_tensor(
+                            obs_dict["goal"], dtype=torch.float32,
+                            device=device)
+                        ah_t = None
+                        if action_history_dim > 0:
+                            ah_t = torch.as_tensor(
+                                eval_action_hist, dtype=torch.float32,
+                                device=device)
+
+                        if use_goal_only:
+                            features, dec_out = None, None
+                            obs_t, cord_t = None, None
+                        else:
+                            obs_t = torch.as_tensor(
+                                obs_dict["obs"], device=device)
+                            cord_t = torch.as_tensor(
+                                obs_dict["cord"], dtype=torch.float32,
+                                device=device)
+                            if use_simple_encoder:
+                                features = agent.obs_encoder(obs_t[:, -1:])
+                            else:
+                                features = agent.obs_encoder(obs_t, cord_t)
+                            if args.use_decoder:
+                                tokens = agent.action_decoder.positional_encoding(
+                                    features)
+                                dec_out = agent.action_decoder.sa_decoder(
+                                    tokens).mean(dim=1)
+                            else:
+                                dec_out = None
+
+                        action, _, _, _, eval_lstm = (
+                            agent.get_action_and_value(
+                                obs_t, cord_t, goal_t, eval_lstm,
+                                features=features, dec_out=dec_out,
+                                action_history=ah_t,
+                            )
+                        )
+
+                    actions_np = action.cpu().numpy()
+                    bufs.actions[step] = actions_np
+
+                    if action_history_dim > 0:
+                        if n_action_history > 1:
+                            eval_action_hist[:, :-action_dim] = \
+                                eval_action_hist[:, action_dim:]
+                        eval_action_hist[:, -action_dim:] = actions_np
+
+                    obs_dict, rewards, terminateds, truncateds, infos = \
+                        vec_env.step(actions_np)
+                    dones = np.logical_or(
+                        terminateds, truncateds).astype(np.float32)
+
+                    weather_tracker.update(infos)
+                    geodesic_tracker.update(infos)
+
+                    # collect vis data
+                    for i in range(num_envs):
+                        sf = infos[i].get('substep_frames')
+                        if sf is not None:
+                            substep_frames[i].append(sf)
+                        entry = {}
+                        wp = infos[i].get('policy_waypoints_cam')
+                        if wp is not None:
+                            entry['policy_waypoints_cam'] = wp
+                        x_sol = infos[i].get('mpc_x_sol')
+                        u_sol = infos[i].get('mpc_u_sol')
+                        if x_sol is not None:
+                            entry['mpc_x_sol'] = x_sol
+                            entry['mpc_u_sol'] = u_sol
+                        if entry:
+                            mpc_vis_data[i].append(entry)
+                        pp = infos[i].get('pedestrian_positions_std')
+                        ped_positions[i].append(
+                            pp if pp is not None else np.empty((0, 2)))
+
+                    eval_tracker.step(rewards, dones, infos)
+                    bufs.store_control_info(step, infos)
+                    bufs.raw_rewards[step] = rewards
+                    bufs.rewards[step] = rewards
+                    bufs.dones[step] = dones
+                    bufs.terminateds[step] = terminateds.astype(np.float32)
+
+                    for i in range(num_envs):
+                        if dones[i]:
+                            eval_lstm[0][:, i, :] = 0
+                            eval_lstm[1][:, i, :] = 0
+                            if action_history_dim > 0:
+                                eval_action_hist[i] = 0
+
+                _eval_rollout_time = time.time() - _phase_t
+
+                # ── visualizations (consume bufs before training overwrites) ──
+                _phase_t = time.time()
+                _enc = agent.obs_encoder if not use_goal_only else None
+                visualize(iteration, args, bufs, bev_images, bev_metas, wandb,
+                          substep_frames=substep_frames, obs_encoder=_enc,
+                          obstacle_layouts=obstacle_layouts,
+                          mpc_vis_data=mpc_vis_data)
+                vec_env.set_collect_substep_frames(False)
+                _vis_main_time = time.time() - _phase_t
+
+                '''
+                # CCTV video
+                _phase_t = time.time()
+                try:
+                    cctv_data = vec_env.collect_cctv_frames()
+                    if cctv_data.get('frames'):
+                        vis_dir = os.path.join(args.save_dir, "vis")
+                        log_cctv_video_grid(
+                            cctv_data,
+                            bufs.cord, bufs.actions,
+                            buf_rewards=bufs.raw_rewards,
+                            buf_dones=bufs.dones,
+                            buf_terminateds=bufs.terminateds,
+                            ped_positions=ped_positions,
+                            obstacle_layouts=obstacle_layouts,
+                            fps=args.vis_video_fps,
+                            iteration=iteration,
+                            save_dir=os.path.join(args.save_dir, "vis"),
+                            wandb=wandb,
+                            grid_cols=args.num_agents_per_server,
+                        )
+                except Exception as e:
+                    print(f"  [CCTV] video generation failed: {e}")
+                try:
+                    vec_env.destroy_cctv_cameras()
+                except Exception:
+                    pass
+                _vis_cctv_time = time.time() - _phase_t
+                '''
+
+
+                # Obstacle layout BEV
+                _phase_t = time.time()
+                if obstacle_layouts is not None:
+                    try:
+                        vis_dir = os.path.join(args.save_dir, "vis")
+                        log_obstacle_bev_figure(
+                            obstacle_layouts,
+                            bev_metas,
+                            ped_positions=ped_positions,
+                            grid_cols=args.num_agents_per_server,
+                            iteration=iteration,
+                            save_dir=vis_dir,
+                            wandb=wandb,
+                        )
+                    except Exception as e:
+                        print(f"  [BEV-obstacle] obstacle layout vis failed: {e}")
+
+                _vis_obs_bev_time = time.time() - _phase_t
+
+                # Geodesic distance field
+                _phase_t = time.time()
+                if obstacle_layouts is not None and args.dynamic_geo_mode != 'off':
+                    try:
+                        vis_dir = os.path.join(args.save_dir, "vis")
+                        log_geodesic_field(
+                            obstacle_layouts,
+                            bev_metas,
+                            grid_cols=args.num_agents_per_server,
+                            iteration=iteration,
+                            save_dir=vis_dir,
+                            wandb=wandb,
+                            video_fps=args.vis_video_fps,
+                        )
+                    except Exception as e:
+                        print(f"  [BEV-geodesic] geodesic field vis failed: {e}")
+
+                _vis_geodesic_time = time.time() - _phase_t
+
+                # Weather distributions
+                if weather_tracker.num_samples > 0:
+                    try:
+                        vis_dir = os.path.join(args.save_dir, "vis")
+                        log_weather_distributions(
+                            weather_tracker,
+                            iteration=iteration,
+                            save_dir=vis_dir,
+                            wandb=wandb,
+                        )
+                    except Exception as e:
+                        print(f"  [VIS] weather distribution vis failed: {e}")
+
+                # Geodesic distance distributions
+                if geodesic_tracker.num_samples > 0:
+                    try:
+                        vis_dir = os.path.join(args.save_dir, "vis")
+                        log_geodesic_distributions(
+                            geodesic_tracker,
+                            iteration=iteration,
+                            save_dir=vis_dir,
+                            wandb=wandb,
+                        )
+                    except Exception as e:
+                        print(f"  [VIS] geodesic distribution vis failed: {e}")
+
+                # Eval metrics
+                eval_stats = eval_tracker.flush()
+
+                # Reset for training
+                _phase_t = time.time()
+                obs_dict, reset_infos = vec_env.reset()
+                _train_reset_time = time.time() - _phase_t
+                lstm_state = agent.get_initial_lstm_state(num_envs, device)
+                action_hist[:] = 0
+                ep_tracker.reset_in_progress()
+                weather_tracker.update(reset_infos)
+                geodesic_tracker.update(reset_infos)
+
+                _eval_total = time.time() - _eval_t0
+                print(
+                    f"  [EVAL TIMING] total={_eval_total:.1f}s  "
+                    f"eval_reset={_eval_reset_time:.1f}s  "
+                    f"bev_init={_bev_init_time:.1f}s  "
+                    f"cctv_spawn={_cctv_spawn_time:.1f}s  "
+                    f"eval_rollout={_eval_rollout_time:.1f}s  "
+                    f"vis_main={_vis_main_time:.1f}s  "
+                    # f"vis_cctv={_vis_cctv_time:.1f}s  "
+                    f"vis_obs_bev={_vis_obs_bev_time:.1f}s  "
+                    f"vis_geodesic={_vis_geodesic_time:.1f}s  "
+                    f"train_reset={_train_reset_time:.1f}s"
+                )
+
+            # ════════════════════════════════════════════════════
+            # ── TRAINING ROLLOUT ───────────────────────────────
+            # ════════════════════════════════════════════════════
             agent.eval()
             if not use_goal_only:
                 agent.obs_encoder.eval()
@@ -505,20 +788,17 @@ def train(args):
             for step in range(num_steps):
                 global_step += num_envs
 
-                # store current observation
                 bufs.obs[step] = obs_dict["obs"]
                 bufs.cord[step] = obs_dict["cord"]
                 bufs.goal[step] = obs_dict["goal"]
                 bufs.goal_world[step] = obs_dict.get("goal_world", obs_dict["goal"])
 
-                # store current action history snapshot
                 if action_history_dim > 0:
                     bufs.action_hist[step] = action_hist
 
                 with torch.no_grad():
                     goal_t = torch.as_tensor(obs_dict["goal"], dtype=torch.float32, device=device)
 
-                    # action history tensor (None when disabled)
                     ah_t = None
                     if action_history_dim > 0:
                         ah_t = torch.as_tensor(action_hist, dtype=torch.float32, device=device)
@@ -532,18 +812,17 @@ def train(args):
                         obs_t = torch.as_tensor(obs_dict["obs"], device=device)
                         cord_t = torch.as_tensor(obs_dict["cord"], dtype=torch.float32, device=device)
 
-                        # compute frozen encoder + decoder transformer once; cache on GPU
                         with timer("encoder"):
                             if use_simple_encoder:
-                                features = agent.obs_encoder(obs_t[:, -1:])  # (num_envs, 1, 768)
+                                features = agent.obs_encoder(obs_t[:, -1:])
                             else:
-                                features = agent.obs_encoder(obs_t, cord_t)  # (num_envs, context_size+1, 768)
+                                features = agent.obs_encoder(obs_t, cord_t)
                         bufs.features_gpu[step] = features
 
                         if args.use_decoder:
                             with timer("decoder"):
                                 tokens = agent.action_decoder.positional_encoding(features)
-                                dec_out = agent.action_decoder.sa_decoder(tokens).mean(dim=1)  # (num_envs, 768)
+                                dec_out = agent.action_decoder.sa_decoder(tokens).mean(dim=1)
                             bufs.dec_out_gpu[step] = dec_out
                         else:
                             dec_out = None
@@ -562,19 +841,16 @@ def train(args):
                 bufs.logprobs[step] = logprob.cpu().numpy()
                 bufs.values[step] = value.cpu().numpy()
 
-                # update rolling action history: shift left by action_dim, append new action
                 if action_history_dim > 0:
                     if n_action_history > 1:
                         action_hist[:, :-action_dim] = action_hist[:, action_dim:]
                     action_hist[:, -action_dim:] = actions_np
 
-                # The env now expects (num_envs, future_length * 2) waypoints.
                 env_actions = actions_np
                 with timer("env_step"):
                     obs_dict, rewards, terminateds, truncateds, infos = vec_env.step(env_actions)
                 dones = np.logical_or(terminateds, truncateds).astype(np.float32)
 
-                # Aggregate env-side timing (MPC, sim tick) from info dicts
                 sim_ticks = [info.get('sim_tick_time', 0.0) for info in infos]
                 if sim_ticks:
                     timer.record("sim_tick", np.mean(sim_ticks))
@@ -584,40 +860,13 @@ def train(args):
                         timer.record("mpc_solve", np.mean(mpc_times))
 
                 weather_tracker.update(infos)
+                geodesic_tracker.update(infos)
 
-                # collect substep frames on vis iterations
-                if substep_frames is not None:
-                    for i in range(num_envs):
-                        sf = infos[i].get('substep_frames')
-                        if sf is not None:
-                            substep_frames[i].append(sf)
-
-                # collect MPC/policy vis data on vis iterations
-                if mpc_vis_data is not None:
-                    for i in range(num_envs):
-                        entry = {}
-                        wp = infos[i].get('policy_waypoints_cam')
-                        if wp is not None:
-                            entry['policy_waypoints_cam'] = wp
-                        x_sol = infos[i].get('mpc_x_sol')
-                        u_sol = infos[i].get('mpc_u_sol')
-                        if x_sol is not None:
-                            entry['mpc_x_sol'] = x_sol
-                            entry['mpc_u_sol'] = u_sol
-                        if entry:
-                            mpc_vis_data[i].append(entry)
-
-                # episode tracking (before reward clipping/normalization)
                 ep_tracker.step(rewards, dones, infos)
-
                 bufs.store_control_info(step, infos)
-
                 bufs.raw_rewards[step] = np.copy(rewards)
 
-                # For truncated (not terminated) episodes, compute the
-                # bootstrap value from the terminal observation.
-                # Truncation is artificial — the future value should not be
-                # zero; instead, we bootstrap from V(s_terminal).
+                # Truncation bootstrap
                 for i in range(num_envs):
                     if truncateds[i] and not terminateds[i]:
                         term_obs = infos[i].get('terminal_observation')
@@ -648,11 +897,9 @@ def train(args):
                                 bufs.trunc_values[step, i] = tv
                                 bufs.has_trunc_value[step, i] = 1.0
 
-                # reward clipping
                 if args.reward_clip > 0:
                     rewards = np.clip(rewards, -args.reward_clip, args.reward_clip)
 
-                # reward normalization (update stats with raw, store normalized)
                 if reward_rms is not None:
                     reward_rms.update(rewards)
                     rewards = reward_rms.normalize(rewards)
@@ -661,15 +908,12 @@ def train(args):
                 bufs.dones[step] = dones
                 bufs.terminateds[step] = terminateds.astype(np.float32)
 
-                # reset LSTM and action history for finished episodes
                 for i in range(num_envs):
                     if dones[i]:
                         lstm_state[0][:, i, :] = 0
                         lstm_state[1][:, i, :] = 0
                         if action_history_dim > 0:
                             action_hist[i] = 0
-                        # record post-reset spawn for the new episode
-                        ep_accum.on_episode_end(i, obs_dict['cord'][i])
 
             # ── bootstrap value for end of rollout ──
             with timer("bootstrap"):
@@ -690,13 +934,9 @@ def train(args):
                         ).cpu().numpy()
 
             # ── Build next_values array for GAE ──
-            # Default: next_values[t] = values[t+1], last step = last_value.
-            # Override: at truncated (not terminated) steps, use the stored
-            # terminal-state value so the bootstrap is correct.
             next_values = np.zeros_like(bufs.values)
             next_values[:-1] = bufs.values[1:]
             next_values[-1] = last_value
-            # Overwrite with terminal bootstrap values where available
             mask = bufs.has_trunc_value > 0
             next_values[mask] = bufs.trunc_values[mask]
 
@@ -708,7 +948,6 @@ def train(args):
                     gamma=args.gamma, gae_lambda=args.gae_lambda,
                 )
 
-            # Reset truncation buffers for next rollout
             bufs.trunc_values[:] = 0
             bufs.has_trunc_value[:] = 0
 
@@ -724,23 +963,25 @@ def train(args):
                                    initial_lstm_state, device,
                                    use_goal_only=use_goal_only)
 
-            # ── logging / vis / checkpoint ──
+            # ── logging / checkpoint ──
             ep_stats = ep_tracker.flush()
-            # Merge env-level solvability stats into episode stats for
-            # unified logging (reset counters each flush cycle).
             try:
                 solv_stats = vec_env.get_solvability_stats(reset=True)
                 if ep_stats is not None:
                     ep_stats.update({
                         'unsolvable_rate': solv_stats['unsolvable_rate'],
                         'unsolvable_episodes': solv_stats['unsolvable_episodes'],
+                        'obstacle_spawn_requested': solv_stats.get(
+                            'obstacle_spawn_requested', 0),
+                        'obstacle_spawn_failed': solv_stats.get(
+                            'obstacle_spawn_failed', 0),
+                        'obstacle_spawn_fail_rate': solv_stats.get(
+                            'obstacle_spawn_fail_rate', 0.0),
                     })
                 elif solv_stats.get('unsolvable_episodes', 0) > 0:
-                    # No completed episodes this iteration, but we still
-                    # want to surface solvability warnings.
                     ep_stats = solv_stats
             except Exception:
-                pass  # env may not support solvability stats (e.g. PointNavEnv)
+                pass
             should_log_wandb = (args.log_every > 0
                                 and iteration % args.log_every == 0)
             ep_reward = log_metrics(iteration, args.num_iterations, global_step,
@@ -748,84 +989,9 @@ def train(args):
                                     ep_stats=ep_stats,
                                     log_wandb=should_log_wandb,
                                     timer=timer)
-
-            if is_vis_iter:
-                _enc = agent.obs_encoder if not use_goal_only else None
-                visualize(iteration, args, bufs, bev_images, bev_metas, wandb,
-                          substep_frames=substep_frames, obs_encoder=_enc,
-                          obstacle_layouts=obstacle_layouts,
-                          mpc_vis_data=mpc_vis_data)
-                vec_env.set_collect_substep_frames(False)
-
-                # ── complete-episode BEV (retroactive capture at spawn positions)
-                try:
-                    ep_specs, ep_key_map = compute_episode_bev_specs(
-                        bufs.cord, bufs.goal_world, bufs.dones,
-                        ep_accum.continuation_spawns,
-                        default_altitude=args.bev_altitude,
-                        fov=args.bev_fov,
-                    )
-                    ep_bev_results = vec_env.capture_bev_at_positions(
-                        ep_specs,
-                        fov=args.bev_fov,
-                        img_size=args.bev_img_size,
-                    )
-                    vis_dir = os.path.join(args.save_dir, "vis")
-                    log_complete_episode_bev(
-                        bufs.cord, bufs.goal_world, bufs.raw_rewards,
-                        bufs.dones, ep_accum.continuation_spawns,
-                        ep_bev_results, ep_key_map,
-                        grid_cols=args.num_agents_per_server,
-                        iteration=iteration,
-                        save_dir=vis_dir,
-                        wandb=wandb,
-                    )
-                except Exception as e:
-                    print(f"  [BEV-ep] complete-episode vis failed: {e}")
-
-                # ── obstacle layout BEV (dark background, obstacles + crosswalks + pedestrians)
-                if obstacle_layouts is not None:
-                    try:
-                        vis_dir = os.path.join(args.save_dir, "vis")
-                        log_obstacle_bev_figure(
-                            obstacle_layouts,
-                            bev_metas,
-                            grid_cols=args.num_agents_per_server,
-                            iteration=iteration,
-                            save_dir=vis_dir,
-                            wandb=wandb,
-                        )
-                    except Exception as e:
-                        print(f"  [BEV-obstacle] obstacle layout vis failed: {e}")
-
-                # ── geodesic distance field heatmap / video ──
-                if obstacle_layouts is not None and args.dynamic_geo_mode != 'off':
-                    try:
-                        vis_dir = os.path.join(args.save_dir, "vis")
-                        log_geodesic_field(
-                            obstacle_layouts,
-                            bev_metas,
-                            grid_cols=args.num_agents_per_server,
-                            iteration=iteration,
-                            save_dir=vis_dir,
-                            wandb=wandb,
-                            video_fps=args.vis_video_fps,
-                        )
-                    except Exception as e:
-                        print(f"  [BEV-geodesic] geodesic field vis failed: {e}")
-
-                # ── weather parameter distributions ──
-                if weather_tracker.num_samples > 0:
-                    try:
-                        vis_dir = os.path.join(args.save_dir, "vis")
-                        log_weather_distributions(
-                            weather_tracker,
-                            iteration=iteration,
-                            save_dir=vis_dir,
-                            wandb=wandb,
-                        )
-                    except Exception as e:
-                        print(f"  [VIS] weather distribution vis failed: {e}")
+            if eval_stats is not None:
+                log_eval_metrics(eval_stats, global_step, wandb,
+                                 log_wandb=should_log_wandb)
 
             if iteration % args.save_every == 0:
                 best_reward = save_checkpoint(iteration, args, agent, optimizer,
@@ -925,6 +1091,10 @@ if __name__ == "__main__":
                         help="Directory containing precomputed navmesh cache NPZ files "
                              "(from export_carla_navmesh.py --cache-all). "
                              "Speeds up crosswalk detection and walkable-area sampling.")
+    parser.add_argument("--scenario_dir", type=str, default=None,
+                        help="Directory containing precomputed scenario files "
+                             "(from generate_scenarios.py). Eliminates runtime "
+                             "Dijkstra by loading baked distance fields.")
     # multi-agent (quadrant split)
     parser.add_argument("--num_agents_per_server", type=int, default=4,
                         help="Number of agents per CARLA server (quadrant split). "
@@ -932,7 +1102,7 @@ if __name__ == "__main__":
     parser.add_argument("--towns", type=str, nargs="+",
                         default=["Town02", "Town03", "Town05", "Town10HD"],
                         help="CARLA town names to randomly cycle through.")
-    parser.add_argument("--map_change_interval", type=int, default=0,
+    parser.add_argument("--map_change_interval", type=int, default=0,   # deprecated!
                         help="Change map every N completed episodes per server "
                              "(0 = only on full reset).")
     # CARLA server auto-launch (optional — omit --carla_bin to connect manually)
@@ -943,7 +1113,7 @@ if __name__ == "__main__":
                              "Defaults to 0..num_envs-1.")
     parser.add_argument("--carla_startup_wait", type=int, default=30,
                         help="Seconds to wait after launching CARLA servers.")
-    parser.add_argument("--carla_stagger_delay", type=int, default=5,
+    parser.add_argument("--carla_stagger_delay", type=int, default=5,       # deprecated!
                         help="Seconds to wait between launching each CARLA server "
                              "to avoid Vulkan init contention (0 = no stagger).")
     # PPO
@@ -1020,5 +1190,8 @@ if __name__ == "__main__":
     parser.add_argument("--vis_video_fps", type=int, default=1,
                         help="Playback FPS for the ego-view video. "
                              "Matches the policy step rate (default 5 Hz).")
+    parser.add_argument("--vis_ego_per_env", action="store_true",
+                        help="Generate individual per-env ego videos in "
+                             "addition to the tiled grid video.")
 
     train(parser.parse_args())

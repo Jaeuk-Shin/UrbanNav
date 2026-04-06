@@ -107,6 +107,26 @@ class GeodesicDistanceField:
               f"{n_walk} walkable cells "
               f"({100. * n_walk / (self._H * self._W):.1f}%)")
 
+    @classmethod
+    def from_metadata(cls, x_min: float, z_min: float,
+                      H: int, W: int, resolution: float):
+        """Create a lightweight instance from grid metadata only.
+
+        Skips triangle loading and rasterization — only provides
+        ``query()`` and ``trace_path()`` on precomputed distance fields.
+        """
+        obj = object.__new__(cls)
+        obj._x_min = float(x_min)
+        obj._z_min = float(z_min)
+        obj._H = int(H)
+        obj._W = int(W)
+        obj._resolution = float(resolution)
+        obj._walkable_tris_std = None
+        obj._base_grid = None
+        obj._static_walkable = None
+        print(f"  [Geodesic] Grid {H}x{W} @ {resolution}m (metadata-only)")
+        return obj
+
     # ── Rasterisation ─────────────────────────────────────────────────
 
     def _rasterize(self, tris_std: np.ndarray) -> np.ndarray:

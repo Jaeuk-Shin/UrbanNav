@@ -60,6 +60,15 @@ def log_metrics(iteration, num_iterations, global_step, bufs, stats,
                 f"rate={ep_stats['unsolvable_rate']:.1%}  "
                 f"retries={ep_stats.get('mean_goal_retries', 0):.2f}/ep"
             )
+        spawn_str = ""
+        obs_fail = ep_stats.get('obstacle_spawn_failed', 0)
+        if obs_fail > 0:
+            obs_req = ep_stats.get('obstacle_spawn_requested', 0)
+            spawn_str = (
+                f"\n  obstacle spawns: "
+                f"failed={obs_fail}/{obs_req}  "
+                f"rate={ep_stats.get('obstacle_spawn_fail_rate', 0):.1%}"
+            )
         print(
             f"  episodes: n={ep_stats['num_episodes']}  "
             f"success={ep_stats['success_rate']:.2f}  "
@@ -69,6 +78,7 @@ def log_metrics(iteration, num_iterations, global_step, bufs, stats,
             f"final_dist={ep_stats['mean_final_distance']:.2f}"
             f"{col_str}"
             f"{solv_str}"
+            f"{spawn_str}"
         )
 
     # Print timing summary to console
@@ -111,6 +121,34 @@ def log_metrics(iteration, num_iterations, global_step, bufs, stats,
     return ep_reward
 
 
+def log_eval_metrics(eval_stats, global_step, wandb_module, log_wandb=True):
+    """Print eval summary and log to W&B with eval/ prefix."""
+    if eval_stats is None:
+        return
+    col_str = ""
+    if eval_stats.get('obstacle_collision_rate', 0) > 0 or \
+       eval_stats.get('pedestrian_collision_rate', 0) > 0:
+        col_str = (
+            f"  obs={eval_stats['mean_obstacle_collisions']:.1f}/ep "
+            f"({eval_stats['obstacle_collision_rate']:.0%})  "
+            f"ped={eval_stats['mean_pedestrian_collisions']:.1f}/ep "
+            f"({eval_stats['pedestrian_collision_rate']:.0%})"
+        )
+    print(
+        f"  [EVAL] n={eval_stats['num_episodes']}  "
+        f"success={eval_stats['success_rate']:.2f}  "
+        f"spl={eval_stats['spl']:.3f}  "
+        f"return={eval_stats['mean_episode_return']:+.2f}  "
+        f"len={eval_stats['mean_episode_length']:.1f}  "
+        f"dist={eval_stats['mean_final_distance']:.2f}"
+        f"{col_str}"
+    )
+    if wandb_module is not None and log_wandb:
+        log_dict = {}
+        for k, v in eval_stats.items():
+            log_dict[f"eval/{k}"] = v
+        wandb_module.log(log_dict, step=global_step)
+
 
 # ─── Episode Tracker ─────────────────────────────────────────────────
 class EpisodeTracker:
@@ -151,6 +189,17 @@ class EpisodeTracker:
                 self._ep_length[i] = 0
                 self._ep_obs_collisions[i] = 0
                 self._ep_ped_collisions[i] = 0
+
+    def reset_in_progress(self):
+        """Zero per-env accumulators for in-progress episodes.
+
+        Call after resetting environments to discard stale partial-episode
+        state (e.g. when inserting a dedicated eval phase that resets envs).
+        """
+        self._ep_return[:] = 0
+        self._ep_length[:] = 0
+        self._ep_obs_collisions[:] = 0
+        self._ep_ped_collisions[:] = 0
 
     def flush(self):
         """Return aggregated stats and clear buffer. Returns None if no episodes completed."""
@@ -195,44 +244,3 @@ class EpisodeTracker:
         }
         self._completed.clear()
         return stats
-
-
-# ─── Episode Trajectory Accumulator ──────────────────────────────────
-class EpisodeTrajectoryAccumulator:
-    """Track per-env spawn positions across rollout boundaries.
-
-    Maintains the spawn position (x_std, z_std) of each env's current
-    in-progress episode.  At visualization time this provides the spawn
-    for the "continuation" episode (ep 0) that started before the rollout.
-    Spawns for episodes starting mid-rollout are read directly from
-    ``bufs.cord`` at the episode-start step.
-    """
-
-    def __init__(self, num_envs):
-        self.num_envs = num_envs
-        self._spawn_xz = np.zeros((num_envs, 2), dtype=np.float32)
-
-    def set_initial_spawns(self, cord):
-        """Call once after ``vec_env.reset()``.
-
-        Parameters
-        ----------
-        cord : (num_envs, context_size*2) float32
-            The ``obs_dict['cord']`` from the initial reset.
-        """
-        self._spawn_xz[:] = cord[:, -2:]
-
-    def on_episode_end(self, env_idx, new_cord_flat):
-        """Update spawn for *env_idx* after auto-reset.
-
-        Parameters
-        ----------
-        new_cord_flat : (context_size*2,) float32
-            The post-reset ``obs_dict['cord'][env_idx]``.
-        """
-        self._spawn_xz[env_idx] = new_cord_flat[-2:]
-
-    @property
-    def continuation_spawns(self):
-        """(num_envs, 2) spawn of each env's in-progress episode."""
-        return self._spawn_xz.copy()

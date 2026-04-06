@@ -5,6 +5,15 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.collections import LineCollection
+from matplotlib.lines import Line2D
+from matplotlib.patches import Patch, Polygon as MplPolygon
+from matplotlib.collections import PolyCollection
+from matplotlib.colors import Normalize
+from matplotlib.cm import ScalarMappable
+
+from PIL import Image, ImageDraw
+import imageio  # noqa: F401
+import tempfile
 
 
 # ─── Visualisation ───────────────────────────────────────────────────
@@ -12,9 +21,11 @@ def visualize(iteration, args, bufs, bev_images, bev_metas, wandb_module,
               substep_frames=None, obs_encoder=None, obstacle_layouts=None,
               mpc_vis_data=None):
     """Log BEV trajectory, control, and ego-video figures."""
+    import time as _time
     vis_dir = os.path.join(args.save_dir, "vis")
     wrun = wandb_module
 
+    _t = _time.time()
     log_bev_figure(
         bufs.cord, bufs.goal_world, bufs.raw_rewards, bufs.dones,
         buf_actions=bufs.actions,
@@ -26,19 +37,26 @@ def visualize(iteration, args, bufs, bev_images, bev_metas, wandb_module,
         save_dir=vis_dir,
         wandb=wrun,
     )
+    _bev_t = _time.time() - _t
+
     '''
-    log_ego_video(
-        bufs.obs,
-        buf_rewards=bufs.raw_rewards,
-        buf_dones=bufs.dones,
-        buf_goal=bufs.goal,
-        fps=args.vis_video_fps,
-        iteration=iteration,
-        save_dir=vis_dir,
-        wandb=wrun,
-        substep_frames=substep_frames,
-    )
+    _t = _time.time()
+    if getattr(args, 'vis_ego_per_env', False):
+        log_ego_video(
+            bufs.obs,
+            buf_rewards=bufs.raw_rewards,
+            buf_dones=bufs.dones,
+            buf_goal=bufs.goal,
+            fps=args.vis_video_fps,
+            iteration=iteration,
+            save_dir=vis_dir,
+            wandb=wrun,
+            substep_frames=substep_frames,
+        )
+    _ego_t = _time.time() - _t
     '''
+    
+    _t = _time.time()
     log_ego_video_grid(
         bufs.obs,
         buf_rewards=bufs.raw_rewards,
@@ -53,7 +71,10 @@ def visualize(iteration, args, bufs, bev_images, bev_metas, wandb_module,
         grid_cols=args.num_agents_per_server,
         mpc_vis_data=mpc_vis_data,
     )
-
+    _grid_t = _time.time() - _t
+    
+    '''
+    _t = _time.time()
     if obs_encoder is not None:
         log_dino_pca_video_grid(
             obs_encoder, bufs.obs,
@@ -64,8 +85,10 @@ def visualize(iteration, args, bufs, bev_images, bev_metas, wandb_module,
             grid_cols=args.num_agents_per_server,
             substep_frames=substep_frames,
         )
+    _dino_t = _time.time() - _t
 
     # MPC/policy dashboard (speed, velocity commands, wall times)
+    _t = _time.time()
     if mpc_vis_data is not None and any(len(d) > 0 for d in mpc_vis_data):
         log_mpc_dashboard(
             bufs.cmd_speed, bufs.real_speed,
@@ -88,7 +111,13 @@ def visualize(iteration, args, bufs, bev_images, bev_metas, wandb_module,
             save_dir=vis_dir,
             wandb=wrun,
         )
-
+    _mpc_t = _time.time() - _t
+    
+    print(
+        f"  [VIS TIMING] bev={_bev_t:.1f}s  ego_video={_ego_t:.1f}s  "
+        f"ego_grid={_grid_t:.1f}s  dino_pca={_dino_t:.1f}s  mpc={_mpc_t:.1f}s"
+    )
+    '''
 
 # ─── BEV Trajectory Visualization ────────────────────────────────────
 
@@ -114,6 +143,178 @@ def _bev_world_to_pixel(xz_world, meta):
     u = s / 2.0 + scale * dx
     v = s / 2.0 - scale * dz
     return np.stack([u, v], axis=-1)
+
+
+# ─── CCTV camera helpers ─────────────────────────────────────────────
+
+def compute_cctv_specs(obs_cord, obs_goal_world, obstacle_layouts=None,
+                       pitch_deg=-45.0, fov=90.0, min_altitude=12.0,
+                       margin=5.0):
+    """Compute per-env CCTV camera placement specs.
+
+    The camera is placed to the side of the start→goal line at an
+    elevation determined by the scene extent, looking at the scene
+    centre with *pitch_deg* tilt (default −45°, i.e. looking downward).
+
+    Returns list of dicts with keys needed by
+    ``CarlaMultiAgentEnv.spawn_cctv_cameras``.
+    """
+    num_envs = len(obs_cord)
+    current_xz = obs_cord[:, -2:]                          # (E, 2)
+    goal_global = current_xz + obs_goal_world              # (E, 2)
+    fov_rad = math.radians(fov)
+
+    specs = []
+    for env_idx in range(num_envs):
+        pts = [current_xz[env_idx].reshape(1, 2),
+               goal_global[env_idx].reshape(1, 2)]
+
+        if obstacle_layouts is not None and env_idx < len(obstacle_layouts):
+            layout = obstacle_layouts[env_idx]
+            agents = layout.get('agents', []) if layout else []
+            aidx = env_idx % len(agents) if agents else -1
+            ag = agents[aidx] if 0 <= aidx < len(agents) else None
+            if ag is not None:
+                geo = ag.get('geodesic_path_std')
+                if geo is not None and len(geo) >= 2:
+                    pts.append(np.asarray(geo))
+
+        all_pts = np.vstack(pts)
+        valid = np.isfinite(all_pts).all(axis=1)
+        if not valid.any():
+            specs.append(None)
+            continue
+        all_pts = all_pts[valid]
+
+        # Bounding box of start + goal + geodesic
+        lo = all_pts.min(axis=0)
+        hi = all_pts.max(axis=0)
+        center_xz = (lo + hi) / 2.0
+        extent = np.max(hi - lo) / 2.0 + margin
+
+        # Altitude: ensure the FOV covers the full extent on the ground
+        # At pitch_deg tilt, the effective ground footprint is larger
+        # than for a top-down camera, but we size for the horizontal FOV
+        # projected onto the near-ground plane.
+        pitch_rad = math.radians(abs(pitch_deg))
+        # Ground width visible = 2 * altitude * tan(fov/2) / sin(pitch)
+        # Solve for altitude: altitude = extent * sin(pitch) / tan(fov/2)
+        altitude = max(min_altitude,
+                       extent * math.sin(pitch_rad) / math.tan(fov_rad / 2.0))
+
+        # Camera offset direction: perpendicular to start→goal for a side view
+        sg = goal_global[env_idx] - current_xz[env_idx]
+        sg_len = np.linalg.norm(sg)
+        if sg_len > 1e-3:
+            sg_unit = sg / sg_len
+            # Perpendicular (rotate 90° CCW in the xz plane)
+            perp = np.array([-sg_unit[1], sg_unit[0]])
+        else:
+            perp = np.array([1.0, 0.0])
+
+        # Horizontal offset from center: at the given pitch, the camera
+        # needs to be offset so it looks at the center from the side.
+        horiz_offset = altitude / math.tan(pitch_rad)
+        cam_xz = center_xz + perp * horiz_offset   # standard (x_std, z_std)
+
+        # Yaw: camera should look from cam_xz toward center_xz
+        # In UE: ue_x = z_std, ue_y = x_std
+        # Camera forward in UE is +X. Yaw rotates around UE Z-up.
+        look_dir_std = center_xz - cam_xz
+        # Convert to UE ground direction: (ue_x, ue_y) = (z_std, x_std)
+        look_ue_x = look_dir_std[1]   # z_std
+        look_ue_y = look_dir_std[0]   # x_std
+        yaw_deg = math.degrees(math.atan2(look_ue_y, look_ue_x))
+
+        # Camera UE position
+        cam_ue_x = cam_xz[1]          # z_std -> ue_x
+        cam_ue_y = cam_xz[0]          # x_std -> ue_y
+        # Ground height approximation: use the first agent's ground level.
+        # A better estimate would come from the env, but 2.0 is reasonable
+        # for CARLA pedestrian maps.
+        ground_z_ue = 2.0
+        cam_ue_z = ground_z_ue + altitude
+
+        specs.append({
+            'agent_idx': env_idx,
+            'cam_ue': np.array([cam_ue_x, cam_ue_y, cam_ue_z]),
+            'pitch_deg': float(pitch_deg),
+            'yaw_deg': float(yaw_deg),
+            'ground_z_ue': float(ground_z_ue),
+            'center_xz': center_xz.astype(np.float32),
+        })
+
+    return [s for s in specs if s is not None]
+
+
+def _cctv_world_to_pixel(xz_std, spec):
+    """Project standard-coord ground points to CCTV image pixels.
+
+    Parameters
+    ----------
+    xz_std  : (..., 2) standard coords (x_right, z_forward)
+    spec    : dict from ``compute_cctv_specs`` enriched with
+              ``fov_deg`` and ``img_size``
+
+    Returns  : (..., 2) float (u, v), (...) bool visibility mask
+    """
+    xz = np.asarray(xz_std, dtype=np.float64)
+    orig_shape = xz.shape[:-1]
+    xz = xz.reshape(-1, 2)
+    N = xz.shape[0]
+
+    img_size = spec['img_size']
+    fov_rad = math.radians(spec['fov_deg'])
+    fx = fy = img_size / (2.0 * math.tan(fov_rad / 2.0))
+    cx = cy = img_size / 2.0
+
+    # World points in UE: ue_x = z_std, ue_y = x_std, ue_z = ground
+    ground_z = spec['ground_z_ue']
+    pts_ue = np.column_stack([xz[:, 1], xz[:, 0],
+                              np.full(N, ground_z)])
+
+    # Camera position in UE
+    cam_ue = np.asarray(spec['cam_ue'], dtype=np.float64)
+
+    # Camera rotation: build world-to-local rotation matrix
+    # CARLA convention: yaw around UE-Z, then pitch around UE-Y
+    yaw_r = math.radians(spec['yaw_deg'])
+    pitch_r = math.radians(spec['pitch_deg'])
+
+    cy_, sy = math.cos(yaw_r), math.sin(yaw_r)
+    cp, sp = math.cos(pitch_r), math.sin(pitch_r)
+
+    # R_yaw (around UE-Z up)
+    R_yaw = np.array([[cy_, -sy, 0.],
+                       [sy,  cy_, 0.],
+                       [0.,  0.,  1.]])
+    # R_pitch (around UE-Y right, UE/CARLA left-hand convention)
+    R_pitch = np.array([[cp,  0., -sp],
+                         [0.,  1., 0.],
+                         [sp,  0., cp]])
+
+    # Actor local-to-world: R_l2w = R_yaw @ R_pitch
+    R_l2w = R_yaw @ R_pitch
+    # World-to-local: R_w2l = R_l2w^T
+    R_w2l = R_l2w.T
+
+    # Transform to actor-local UE frame
+    diff = pts_ue - cam_ue[None, :]           # (N, 3)
+    local_ue = (R_w2l @ diff.T).T             # (N, 3)
+
+    # UE-local to camera convention: cam_x=ue_y, cam_y=-ue_z, cam_z=ue_x
+    cam_x = local_ue[:, 1]
+    cam_y = -local_ue[:, 2]
+    cam_z = local_ue[:, 0]
+
+    # Pinhole projection
+    visible = cam_z > 0.1
+    u = np.where(visible, fx * cam_x / cam_z + cx, -1.0)
+    v = np.where(visible, fy * cam_y / cam_z + cy, -1.0)
+
+    uv = np.stack([u, v], axis=-1).reshape(*orig_shape, 2)
+    visible = visible.reshape(orig_shape)
+    return uv, visible
 
 
 def compute_bev_specs(obs_cord, obs_goal_world,
@@ -303,11 +504,15 @@ def log_bev_figure(
         for spine in ax.spines.values():
             spine.set_visible(False)
 
-        # ── geodesic path (from obstacle_layouts, if available) ────────
-        _geo_path_std = None
+        # ── obstacle layout overlays (from obstacle_layouts) ─────────
+        _layout = None
         if obstacle_layouts is not None and env_idx < len(obstacle_layouts):
             _layout = obstacle_layouts[env_idx]
-            _agents = _layout.get('agents', []) if _layout else []
+
+        # Geodesic path
+        _geo_path_std = None
+        if _layout is not None:
+            _agents = _layout.get('agents', [])
             _aidx = env_idx % len(_agents) if _agents else -1
             _ag = _agents[_aidx] if 0 <= _aidx < len(_agents) else None
             if _ag is not None:
@@ -321,6 +526,26 @@ def log_bev_figure(
                         '-', color='#00E5FF', linewidth=1.2,
                         alpha=0.55, zorder=2,
                         label='geodesic' if env_idx == 0 else None)
+
+        # Obstacle OBBs
+        _OBS_COLORS = {
+            'blocked_crosswalk':       '#E53935',
+            'crosswalk_challenge':     '#E53935',
+            'blocked_crosswalk_flank': '#FB8C00',
+            'crosswalk_challenge_flank': '#FB8C00',
+            'narrow_passage':          '#FFB300',
+            'sidewalk_obstruction':    '#FDD835',
+        }
+        if _layout is not None:
+            for obs in _layout.get('obstacles', []):
+                obs_plot = _to_plot(obs['corners_std'])
+                if np.isfinite(obs_plot).all():
+                    _c = _OBS_COLORS.get(obs['scenario_type'], '#FFFFFF')
+                    poly = MplPolygon(
+                        obs_plot, closed=True,
+                        facecolor=_c, edgecolor='white',
+                        alpha=0.55, linewidth=0.8, zorder=2)
+                    ax.add_patch(poly)
 
         # ── per-env trajectory data ───────────────────────────────────
         xs = current_xz[:, env_idx, 0]
@@ -428,7 +653,7 @@ def log_bev_figure(
         axes[r][c].set_visible(False)
 
     # ── shared legend (bottom-centre) ──────────────────────────────
-    from matplotlib.lines import Line2D
+    
     legend_handles = [
         Line2D([], [], marker=_MARKER['start']['marker'], color='none',
                markerfacecolor=_MARKER['start']['c'],
@@ -440,13 +665,21 @@ def log_bev_figure(
                markerfacecolor=_MARKER['goal']['c'],
                markeredgecolor='white', markersize=12, label='goal'),
     ]
-    if obstacle_layouts is not None and any(
-        any(a.get('geodesic_path_std') is not None for a in l.get('agents', []))
-        for l in obstacle_layouts if l is not None
-    ):
-        legend_handles.append(
-            Line2D([], [], color='#00E5FF', linewidth=1.5,
-                   alpha=0.55, label='geodesic'))
+    if obstacle_layouts is not None:
+        has_obs = any(len(l.get('obstacles', [])) > 0
+                      for l in obstacle_layouts if l is not None)
+        if has_obs:
+            legend_handles.append(
+                Patch(facecolor='#E53935', edgecolor='white',
+                      alpha=0.55, label='obstacle'))
+        if any(
+            any(a.get('geodesic_path_std') is not None
+                for a in l.get('agents', []))
+            for l in obstacle_layouts if l is not None
+        ):
+            legend_handles.append(
+                Line2D([], [], color='#00E5FF', linewidth=1.5,
+                       alpha=0.55, label='geodesic'))
     fig.legend(handles=legend_handles, loc='lower center',
                ncol=len(legend_handles), fontsize=11, framealpha=0.8,
                borderpad=0.4, handletextpad=0.4, columnspacing=1.2)
@@ -477,6 +710,7 @@ def log_bev_figure(
 def log_obstacle_bev_figure(
     obstacle_layouts,
     bev_metas,
+    ped_positions=None,
     grid_cols=None,
     iteration=0,
     save_dir=None,
@@ -503,16 +737,14 @@ def log_obstacle_bev_figure(
     save_dir  : str or None
     wandb     : wandb module or None
     """
-    from matplotlib.patches import Patch, Polygon as MplPolygon
-    from matplotlib.collections import PolyCollection
-    from matplotlib.lines import Line2D
+
 
     num_envs = len(obstacle_layouts)
     if grid_cols is None:
         grid_cols = math.ceil(math.sqrt(num_envs))
     grid_rows = math.ceil(num_envs / grid_cols)
     cell_size = 4.5
-    legend_frac = 0.06
+    legend_frac = 0.10
     fig_h = cell_size * grid_rows / (1 - legend_frac)
 
     BG_COLOR = '#1A1A2E'
@@ -540,6 +772,7 @@ def log_obstacle_bev_figure(
     SEG_ROAD_COLOR = (0.30, 0.30, 0.30, 0.35)         # dark gray
 
     CROSSWALK_COLOR  = '#29B6F6'         # light blue (polygon outlines)
+    CROSSWALK_BLOCKED_COLOR = '#EF5350'  # red (blocked crosswalks)
     CROSSWALK_ALPHA  = 0.35
     OBSTACLE_ALPHA   = 0.75
     PED_TRAJ_COLOR   = '#E040FB'         # magenta / pink
@@ -621,10 +854,12 @@ def log_obstacle_bev_figure(
                 cw_cross = cw_entry.get('cross_axis_std')
                 cw_hl = cw_entry.get('half_length', 0)
                 cw_hw = cw_entry.get('half_width', 0)
+                cw_blocked = cw_entry.get('blocked', False)
             else:
                 cw_std = cw_entry
                 cw_center = cw_long = cw_cross = None
                 cw_hl = cw_hw = 0
+                cw_blocked = False
 
             cw_px = _bev_world_to_pixel(cw_std, meta)
             visible = np.any(
@@ -633,9 +868,10 @@ def log_obstacle_bev_figure(
             if not visible:
                 continue
 
+            cw_color = CROSSWALK_BLOCKED_COLOR if cw_blocked else CROSSWALK_COLOR
             poly = MplPolygon(
                 cw_px, closed=True,
-                facecolor=CROSSWALK_COLOR, edgecolor='white',
+                facecolor=cw_color, edgecolor='white',
                 alpha=CROSSWALK_ALPHA, linewidth=0.8, zorder=2,
             )
             ax.add_patch(poly)
@@ -686,35 +922,61 @@ def log_obstacle_bev_figure(
                 )
                 ax.add_patch(poly)
 
-        # ── pedestrians (trajectories + current position) ────────────
-        for ped in layout.get('pedestrians', []):
-            traj = ped['trajectory_std']
-            traj_px = _bev_world_to_pixel(traj, meta)
-
-            if len(traj_px) >= 2:
-                seg_valid = np.isfinite(traj_px).all(axis=1)
-                traj_px_v = traj_px[seg_valid]
-                if len(traj_px_v) >= 2:
-                    ax.plot(traj_px_v[:, 0], traj_px_v[:, 1],
-                            '-', color=PED_TRAJ_COLOR, linewidth=1.0,
-                            alpha=0.7, zorder=4)
-
-            pos_px = _bev_world_to_pixel(
-                ped['position_std'].reshape(1, 2), meta)[0]
-            if (0 <= pos_px[0] <= s and 0 <= pos_px[1] <= s):
-                ax.plot(pos_px[0], pos_px[1], 'o',
-                        color=PED_MARKER_COLOR, markersize=3,
-                        markeredgecolor=PED_TRAJ_COLOR,
-                        markeredgewidth=0.6, zorder=5)
-
-            if ped.get('destination_std') is not None:
-                dest_px = _bev_world_to_pixel(
-                    ped['destination_std'].reshape(1, 2), meta)[0]
-                if (0 <= dest_px[0] <= s and 0 <= dest_px[1] <= s):
-                    ax.plot(dest_px[0], dest_px[1], 'x',
-                            color=PED_DEST_COLOR, markersize=3,
-                            markeredgewidth=0.8, alpha=0.6, zorder=4)
-
+        
+        # ── pedestrians (accumulated trajectories from ped_positions) ──
+        if (ped_positions is not None
+                and env_idx < len(ped_positions)
+                and len(ped_positions[env_idx]) > 0):
+            # ped_positions[env_idx] is a list of (N_ped, 2) arrays,
+            # one per rollout step.  Build per-pedestrian trails.
+            env_peds = ped_positions[env_idx]
+            T = len(env_peds)
+            n_peds = max((p.shape[0] for p in env_peds if p is not None
+                          and len(p) > 0), default=0)
+            for pi in range(n_peds):
+                trail = []
+                for t in range(T):
+                    if (env_peds[t] is not None
+                            and pi < env_peds[t].shape[0]):
+                        trail.append(env_peds[t][pi])
+                if len(trail) >= 2:
+                    trail_std = np.array(trail)
+                    trail_px = _bev_world_to_pixel(trail_std, meta)
+                    valid = np.isfinite(trail_px).all(axis=1)
+                    trail_px_v = trail_px[valid]
+                    if len(trail_px_v) >= 2:
+                        ax.plot(trail_px_v[:, 0], trail_px_v[:, 1],
+                                '-', color=PED_TRAJ_COLOR, linewidth=1.0,
+                                alpha=0.4, zorder=4)
+                # Current position (last known)
+                if trail:
+                    pos_px = _bev_world_to_pixel(
+                        trail[-1].reshape(1, 2), meta)[0]
+                    if (0 <= pos_px[0] <= s and 0 <= pos_px[1] <= s):
+                        ax.plot(pos_px[0], pos_px[1], 'o',
+                                color=PED_MARKER_COLOR, markersize=3,
+                                markeredgecolor=PED_TRAJ_COLOR,
+                                markeredgewidth=0.6, zorder=5, alpha=0.4)
+        else:
+            # Fallback: use snapshot from obstacle_layouts
+            for ped in layout.get('pedestrians', []):
+                traj = ped['trajectory_std']
+                traj_px = _bev_world_to_pixel(traj, meta)
+                if len(traj_px) >= 2:
+                    seg_valid = np.isfinite(traj_px).all(axis=1)
+                    traj_px_v = traj_px[seg_valid]
+                    if len(traj_px_v) >= 2:
+                        ax.plot(traj_px_v[:, 0], traj_px_v[:, 1],
+                                '-', color=PED_TRAJ_COLOR, linewidth=1.0,
+                                alpha=0.4, zorder=4)
+                pos_px = _bev_world_to_pixel(
+                    ped['position_std'].reshape(1, 2), meta)[0]
+                if (0 <= pos_px[0] <= s and 0 <= pos_px[1] <= s):
+                    ax.plot(pos_px[0], pos_px[1], 'o',
+                            color=PED_MARKER_COLOR, markersize=3,
+                            markeredgecolor=PED_TRAJ_COLOR,
+                            markeredgewidth=0.6, zorder=5, alpha=0.4)
+        
         # ── per-agent annotations (ego, goal, metadata) ──────────────
         agents = layout.get('agents', [])
         # Map flat env_idx to the per-server agent index.  All agents on
@@ -820,6 +1082,16 @@ def log_obstacle_bev_figure(
             Patch(facecolor=CROSSWALK_COLOR, edgecolor='white',
                   alpha=CROSSWALK_ALPHA, label='crosswalk'))
 
+    # Check if any crosswalk is marked as blocked
+    has_blocked_cw = any(
+        any(isinstance(cw, dict) and cw.get('blocked', False)
+            for cw in l.get('crosswalks', []))
+        for l in obstacle_layouts)
+    if has_blocked_cw:
+        legend_handles.append(
+            Patch(facecolor=CROSSWALK_BLOCKED_COLOR, edgecolor='white',
+                  alpha=CROSSWALK_ALPHA, label='blocked crosswalk'))
+
     legend_handles.extend([
         Patch(facecolor='#E53935', edgecolor='white',
               alpha=OBSTACLE_ALPHA, label='blocker / CW challenge'),
@@ -887,294 +1159,6 @@ def log_obstacle_bev_figure(
     plt.close(fig)
 
 
-# ─── Complete-Episode BEV Visualization ──────────────────────────────
-
-
-def compute_episode_bev_specs(buf_cord, buf_goal, buf_dones,
-                              continuation_spawns,
-                              default_altitude=15.0, fov=90.0):
-    """Compute BEV capture specs for every episode visible in the rollout.
-
-    Parameters
-    ----------
-    buf_cord             : (T, E, ctx*2)  position history
-    buf_goal             : (T, E, 2)      goal_world (relative to agent)
-    buf_dones            : (T, E)         done flags
-    continuation_spawns  : (E, 2)         spawn of each env's continuation ep
-    default_altitude     : minimum BEV altitude (metres)
-    fov                  : horizontal FOV (degrees)
-
-    Returns
-    -------
-    specs : list of dict  – one per episode, with keys
-        ``env_idx``, ``ep_idx``, ``center_xz``, ``altitude``
-    ep_key_to_spec_idx : dict  (env_idx, ep_idx) -> index in *specs*
-    """
-    num_steps, num_envs = buf_dones.shape
-    current_xz = buf_cord[:, :, -2:]                # (T, E, 2)
-    goal_global = current_xz + buf_goal             # (T, E, 2)
-
-    specs = []
-    ep_key_to_spec_idx = {}
-
-    for env_idx in range(num_envs):
-        dones = buf_dones[:, env_idx]
-        ep_starts = [0] + (np.where(dones[:-1] > 0)[0] + 1).tolist()
-        ep_ends = np.where(dones > 0)[0].tolist() + [num_steps - 1]
-
-        for ep_i, (t0, t1) in enumerate(zip(ep_starts, ep_ends)):
-            # Spawn position
-            if ep_i == 0:
-                spawn = continuation_spawns[env_idx]
-            else:
-                spawn = current_xz[t0, env_idx]
-
-            goal = goal_global[t0, env_idx]
-            traj = current_xz[t0:t1 + 1, env_idx]   # (L, 2)
-
-            # Bounding box of spawn + goal + trajectory
-            all_pts = np.vstack([spawn.reshape(1, 2),
-                                 goal.reshape(1, 2),
-                                 traj])
-            bb_min = np.nanmin(all_pts, axis=0)
-            bb_max = np.nanmax(all_pts, axis=0)
-            center = (bb_min + bb_max) / 2.0
-            half_ext = np.max((bb_max - bb_min) / 2.0) + 5.0  # margin
-
-            fov_rad = np.deg2rad(fov)
-            altitude = half_ext / np.tan(fov_rad / 2.0)
-            altitude = max(altitude, default_altitude)
-
-            key = (env_idx, ep_i)
-            ep_key_to_spec_idx[key] = len(specs)
-            specs.append({
-                'env_idx': env_idx,
-                'ep_idx': ep_i,
-                'center_xz': center.astype(np.float32),
-                'altitude': float(altitude),
-                'spawn_xz': np.asarray(spawn, dtype=np.float32),
-            })
-
-    return specs, ep_key_to_spec_idx
-
-
-def log_complete_episode_bev(
-    buf_cord, buf_goal, buf_rewards, buf_dones,
-    continuation_spawns,
-    bev_results, ep_key_to_spec_idx,
-    grid_cols=None,
-    iteration=0,
-    save_dir=None,
-    wandb=None,
-):
-    """Render BEV trajectory plots with per-episode backgrounds.
-
-    Each episode in the rollout gets its own BEV image centred on the
-    episode's bounding box (spawn + goal + trajectory), so continuation
-    episodes that started in a previous rollout are shown correctly.
-
-    Parameters
-    ----------
-    buf_cord, buf_goal, buf_rewards, buf_dones : rollout buffers
-    continuation_spawns : (E, 2)  spawn of each env's continuation episode
-    bev_results         : list of (img, meta) | None, indexed by spec order
-    ep_key_to_spec_idx  : dict  (env_idx, ep_idx) -> index in bev_results
-    grid_cols           : columns in the grid (None → ceil(sqrt(E)))
-    """
-    num_steps, num_envs = buf_rewards.shape
-    current_xz = buf_cord[:, :, -2:]
-    goal_global = current_xz + buf_goal
-
-    # ── visual style (same as log_bev_figure) ──
-    _TRAJ_COLOR = '#FFA726'
-    _MARKER = dict(
-        start=dict(marker='^', s=90, c='#43E97B', edgecolors='white',
-                   linewidths=1.2, zorder=5),
-        end=dict(marker='D', s=70, c='#F5576C', edgecolors='white',
-                 linewidths=1.2, zorder=5),
-        goal=dict(marker='*', s=260, c='#667EEA', edgecolors='white',
-                  linewidths=0.9, zorder=6),
-        spawn=dict(marker='o', s=60, c='#00E5FF', edgecolors='white',
-                   linewidths=1.0, zorder=5),
-    )
-
-    if grid_cols is None:
-        grid_cols = math.ceil(math.sqrt(num_envs))
-    grid_rows = math.ceil(num_envs / grid_cols)
-    cell_size = 4.5
-    legend_frac = 0.045
-    fig_h = cell_size * grid_rows / (1 - legend_frac)
-    fig, axes = plt.subplots(
-        grid_rows, grid_cols,
-        figsize=(cell_size * grid_cols, fig_h),
-        squeeze=False,
-    )
-    fig.subplots_adjust(left=0, right=1, top=1, bottom=legend_frac,
-                        wspace=0, hspace=0)
-
-    for env_idx in range(num_envs):
-        row_i, col_i = divmod(env_idx, grid_cols)
-        ax = axes[row_i][col_i]
-
-        dones = buf_dones[:, env_idx]
-        xs = current_xz[:, env_idx, 0]
-        zs = current_xz[:, env_idx, 1]
-        gx = goal_global[:, env_idx, 0]
-        gz = goal_global[:, env_idx, 1]
-
-        ep_starts = [0] + (np.where(dones[:-1] > 0)[0] + 1).tolist()
-        ep_ends = np.where(dones > 0)[0].tolist() + [num_steps - 1]
-
-        # Use the BEV with the widest coverage (highest altitude) so
-        # that points from all episodes have the best chance of falling
-        # within the image bounds.
-        bev_img, bev_meta = None, None
-        best_alt = -1.0
-        for ep_i in range(len(ep_starts)):
-            key = (env_idx, ep_i)
-            spec_idx = ep_key_to_spec_idx.get(key)
-            if spec_idx is not None and bev_results[spec_idx] is not None:
-                candidate_img, candidate_meta = bev_results[spec_idx]
-                if candidate_img is not None:
-                    alt = candidate_meta.get('altitude', 0.0)
-                    if alt > best_alt:
-                        bev_img, bev_meta = candidate_img, candidate_meta
-                        best_alt = alt
-
-        use_bev = bev_img is not None and bev_meta is not None
-
-        def _to_plot(xz_arr):
-            if use_bev:
-                return _bev_world_to_pixel(xz_arr, bev_meta)
-            return xz_arr
-
-        if use_bev:
-            s = bev_meta['img_size']
-            ax.imshow(bev_img, origin="upper",
-                      extent=[0, s, s, 0], aspect="auto")
-            ax.set_xlim(0, s)
-            ax.set_ylim(s, 0)
-        else:
-            s = None
-            ax.set_aspect("auto")
-            ax.grid(True, alpha=0.3)
-        ax.set_xticks([])
-        ax.set_yticks([])
-        for spine in ax.spines.values():
-            spine.set_visible(False)
-
-        # ── draw each episode ──
-        for ep_i, (t0, t1) in enumerate(zip(ep_starts, ep_ends)):
-            ep_xz = np.stack([xs[t0:t1 + 1], zs[t0:t1 + 1]], axis=-1)
-            valid = np.isfinite(ep_xz).all(axis=-1)
-            if not valid.any():
-                continue
-
-            # Spawn position
-            if ep_i == 0:
-                spawn_xz = continuation_spawns[env_idx]
-            else:
-                spawn_xz = ep_xz[0]
-
-            _goal_xz = np.array([gx[t0], gz[t0]])
-
-            # Diagnostic
-            if np.isfinite(spawn_xz).all() and np.isfinite(_goal_xz).all():
-                _gs_dist = float(np.linalg.norm(_goal_xz - spawn_xz))
-                tag = " (continuation)" if ep_i == 0 else ""
-                print(f"  [BEV-ep] env {env_idx} ep {ep_i}: "
-                      f"steps={t1 - t0 + 1}  "
-                      f"goal-spawn dist={_gs_dist:.2f}m  "
-                      f"spawn=({spawn_xz[0]:.1f}, {spawn_xz[1]:.1f})  "
-                      f"goal=({_goal_xz[0]:.1f}, {_goal_xz[1]:.1f})"
-                      f"{tag}")
-
-            ep_plot = _to_plot(ep_xz)
-
-            # Trajectory line
-            L = len(ep_plot)
-            if L >= 2:
-                points = ep_plot.reshape(-1, 1, 2)
-                segments = np.concatenate([points[:-1], points[1:]], axis=1)
-                seg_valid = np.isfinite(segments).all(axis=(1, 2))
-                lc = LineCollection(
-                    segments[seg_valid],
-                    colors=_TRAJ_COLOR,
-                    linewidths=2.0,
-                    zorder=3,
-                )
-                ax.add_collection(lc)
-
-            # Start / end markers (current rollout segment)
-            if np.isfinite(ep_plot[0]).all():
-                ax.scatter(*ep_plot[0], **_MARKER['start'],
-                           label="start" if ep_i == 0 else None)
-            if np.isfinite(ep_plot[-1]).all():
-                ax.scatter(*ep_plot[-1], **_MARKER['end'],
-                           label="end" if ep_i == 0 else None)
-
-            # Spawn marker (true episode start, may differ from rollout start)
-            if ep_i == 0 and np.isfinite(spawn_xz).all():
-                sp = _to_plot(spawn_xz.reshape(1, 2))[0]
-                if (not use_bev) or (0 <= sp[0] < s and 0 <= sp[1] < s):
-                    ax.scatter(*sp, **_MARKER['spawn'],
-                               label="spawn" if ep_i == 0 else None)
-
-            # Goal
-            if np.isfinite(_goal_xz).all():
-                gp = _to_plot(_goal_xz.reshape(1, 2))[0]
-                margin = 20
-                in_bounds = (not use_bev) or (
-                    -margin < gp[0] < s + margin and
-                    -margin < gp[1] < s + margin)
-                if in_bounds:
-                    ax.scatter(*gp, **_MARKER['goal'],
-                               label="goal" if ep_i == 0 else None)
-                    # Dashed line from spawn to goal
-                    if np.isfinite(spawn_xz).all():
-                        sp = _to_plot(spawn_xz.reshape(1, 2))[0]
-                        ax.plot([sp[0], gp[0]], [sp[1], gp[1]],
-                                "--", color="#667EEA", alpha=0.45,
-                                linewidth=1.0, zorder=2)
-
-    # Hide unused axes
-    for idx in range(num_envs, grid_rows * grid_cols):
-        r, c = divmod(idx, grid_cols)
-        axes[r][c].set_visible(False)
-
-    # Shared legend
-    from matplotlib.lines import Line2D
-    legend_handles = [
-        Line2D([], [], marker='^', color='none',
-               markerfacecolor='#43E97B', markeredgecolor='white',
-               markersize=10, label='start'),
-        Line2D([], [], marker='D', color='none',
-               markerfacecolor='#F5576C', markeredgecolor='white',
-               markersize=10, label='end'),
-        Line2D([], [], marker='*', color='none',
-               markerfacecolor='#667EEA', markeredgecolor='white',
-               markersize=12, label='goal'),
-        Line2D([], [], marker='o', color='none',
-               markerfacecolor='#00E5FF', markeredgecolor='white',
-               markersize=8, label='spawn'),
-    ]
-    fig.legend(handles=legend_handles, loc='lower center',
-               ncol=4, fontsize=11, framealpha=0.8,
-               borderpad=0.4, handletextpad=0.4, columnspacing=1.2)
-
-    if save_dir is not None:
-        os.makedirs(save_dir, exist_ok=True)
-        path = os.path.join(save_dir, f"bev_episodes_{iteration:04d}.png")
-        fig.savefig(path, dpi=120)
-        print(f"  → complete-episode BEV saved to {path}")
-
-    if wandb is not None:
-        wandb.log({"rollout/bev_complete_episodes": wandb.Image(fig)},
-                  step=iteration)
-
-    plt.close(fig)
-
-
 # ─── Ego-View Video ───────────────────────────────────────────────────
 
 
@@ -1211,12 +1195,6 @@ def _annotate_ego_frames(frames, rewards=None, dones=None, goals=None,
 
     Returns : (T, H, W, 3) uint8
     """
-    try:
-        from PIL import Image, ImageDraw
-    except ImportError:
-        print("  [video] Pillow not found; frames will have no annotation. "
-              "Run: pip install Pillow")
-        return frames
 
     T, H, W = frames.shape[:3]
     out = []
@@ -1479,7 +1457,6 @@ def log_mpc_dashboard(
     buf_dones      : (num_steps, num_envs) float
     mpc_vis_data   : list[list[dict]] or None — per-env, per-step MPC data
     """
-    import matplotlib.pyplot as plt
 
     num_steps, num_envs = buf_cmd_speed.shape
     if grid_cols is None:
@@ -1690,12 +1667,6 @@ def log_mpc_detail_video_grid(
     buf_cmd_speed, buf_real_speed : (num_steps, num_envs) or None
     buf_dones : (num_steps, num_envs) or None
     """
-    try:
-        import imageio  # noqa: F401
-    except ImportError:
-        print("  [video] imageio not found; "
-              "run: pip install imageio imageio-ffmpeg")
-        return
 
     num_envs = len(mpc_vis_data)
     num_steps = max((len(d) for d in mpc_vis_data), default=0)
@@ -1749,7 +1720,7 @@ def log_mpc_detail_video_grid(
         base = os.path.join(save_dir, stem)
         path = _write_video(grid_video, base, fps)
     else:
-        import tempfile
+        
         tmp_dir = tempfile.mkdtemp()
         path = _write_video(grid_video, os.path.join(tmp_dir, stem), fps)
 
@@ -1897,8 +1868,6 @@ def _render_geodesic_frame(agents, metas, grid_cols, t=None):
     -------
     fig : matplotlib.Figure or None
     """
-    from matplotlib.colors import Normalize
-    from matplotlib.cm import ScalarMappable
 
     num_envs = len(agents)
     if grid_cols is None:
@@ -2033,7 +2002,7 @@ def _write_video(frames, base_path, fps):
     Tries MP4 first (requires imageio-ffmpeg), falls back to GIF.
     Returns the path of the file actually written, or None on failure.
     """
-    import imageio
+    
 
     for ext, kwargs in [
         (".mp4", {"fps": fps, "quality": 7, "macro_block_size": 1}),
@@ -2049,6 +2018,300 @@ def _write_video(frames, base_path, fps):
     print("  [video] could not write MP4 or GIF — "
           "install imageio-ffmpeg for MP4 support.")
     return None
+
+
+# ─── CCTV video ──────────────────────────────────────────────────────
+
+def log_cctv_video_grid(
+    cctv_data,
+    buf_cord,
+    buf_actions,
+    buf_rewards=None,
+    buf_dones=None,
+    buf_terminateds=None,
+    ped_positions=None,
+    obstacle_layouts=None,
+    fps=5,
+    iteration=0,
+    save_dir=None,
+    wandb=None,
+    grid_cols=None,
+):
+    """Assemble CCTV video grid with progressive trajectory overlays.
+
+    Parameters
+    ----------
+    cctv_data   : dict from ``VecCarlaMultiAgentEnv.collect_cctv_frames()``
+                  with ``'frames'`` (env_idx -> (T,H,W,3)) and ``'specs'``.
+    buf_cord    : (num_steps, num_envs, context_size*2) positions
+    buf_actions : (num_steps, num_envs, action_dim)  camera-frame waypoints
+    buf_rewards : (num_steps, num_envs) float or None
+    buf_dones   : (num_steps, num_envs) float or None
+    buf_terminateds : (num_steps, num_envs) float or None
+    ped_positions : list[list[ndarray]]  per-env, per-step (N_ped, 2) std or None
+    obstacle_layouts : list[dict] or None  per-env layout from get_obstacle_layouts
+    fps         : output video fps
+    iteration   : PPO iteration number
+    save_dir    : directory for saved files
+    wandb       : wandb run object or None
+    grid_cols   : columns in the video grid
+    """
+
+    frames_dict = cctv_data.get('frames', {})
+    specs_list = cctv_data.get('specs', [])
+    if not frames_dict or not specs_list:
+        return
+
+    # Build spec lookup by env_idx
+    spec_by_env = {s['agent_idx']: s for s in specs_list}
+
+    # Determine envs that have CCTV frames
+    env_ids = sorted(frames_dict.keys())
+    if not env_ids:
+        return
+
+    num_steps = buf_cord.shape[0]
+
+    if grid_cols is None:
+        grid_cols = math.ceil(math.sqrt(len(env_ids)))
+    grid_rows = math.ceil(len(env_ids) / grid_cols)
+
+    # ── per-env annotated frame sequences ──
+    env_frame_seqs = []
+
+    for env_idx in env_ids:
+        raw = frames_dict[env_idx]
+        spec = spec_by_env.get(env_idx)
+        if raw is None or spec is None:
+            continue
+
+        T_cctv = raw.shape[0]
+        T = min(T_cctv, num_steps)
+        img_size = spec['img_size']
+
+        annotated = []
+        # Ego trajectory accumulator (reset on episode boundary)
+        ego_trail = []
+        cum_r = 0.0
+
+        for t in range(T):
+            arr = raw[t].copy()
+            is_done = buf_dones is not None and buf_dones[t, env_idx] > 0
+            is_terminated = (buf_terminateds is not None
+                             and buf_terminateds[t, env_idx] > 0)
+
+            # ── episode boundary tint ──
+            if is_done:
+                arr = arr.astype(np.float32)
+                if is_terminated:
+                    arr[..., 0] = np.clip(arr[..., 0] * 0.5, 0, 255)
+                    arr[..., 1] = np.clip(arr[..., 1] * 0.5 + 128, 0, 255)
+                    arr[..., 2] = np.clip(arr[..., 2] * 0.5, 0, 255)
+                else:
+                    arr[..., 0] = np.clip(arr[..., 0] * 0.5 + 128, 0, 255)
+                    arr[..., 1] = np.clip(arr[..., 1] * 0.5, 0, 255)
+                    arr[..., 2] = np.clip(arr[..., 2] * 0.5, 0, 255)
+                arr = arr.astype(np.uint8)
+
+            img = Image.fromarray(arr)
+            draw = ImageDraw.Draw(img)
+
+            # Current ego position (standard xz)
+            ego_xz = buf_cord[t, env_idx, -2:]
+            ego_trail.append(ego_xz.copy())
+
+            # ── goal marker ──
+            if obstacle_layouts is not None and env_idx < len(obstacle_layouts):
+                layout = obstacle_layouts[env_idx]
+                agents = layout.get('agents', []) if layout else []
+                aidx = env_idx % len(agents) if agents else -1
+                ag = agents[aidx] if 0 <= aidx < len(agents) else None
+                if ag is not None:
+                    goal_std = ag.get('goal_std')
+                    if goal_std is not None:
+                        guv, gvis = _cctv_world_to_pixel(
+                            np.array(goal_std).reshape(1, 2), spec)
+                        if gvis[0]:
+                            gu, gv = float(guv[0, 0]), float(guv[0, 1])
+                            r = 7
+                            draw.polygon([
+                                (gu, gv - r), (gu + r * 0.7, gv + r * 0.5),
+                                (gu - r * 0.7, gv + r * 0.5),
+                            ], fill=(50, 120, 255), outline=(255, 255, 255))
+
+                    # Geodesic path (thin cyan line)
+                    geo = ag.get('geodesic_path_std')
+                    if geo is not None and len(geo) >= 2:
+                        geo_arr = np.asarray(geo)
+                        guv, gvis = _cctv_world_to_pixel(geo_arr, spec)
+                        pts = [(float(guv[j, 0]), float(guv[j, 1]))
+                               for j in range(len(guv)) if gvis[j]]
+                        if len(pts) >= 2:
+                            draw.line(pts, fill=(0, 200, 200, 100), width=1)
+
+            # ── ego trajectory up to t (green) ──
+            if len(ego_trail) >= 2:
+                trail_arr = np.array(ego_trail)
+                tuv, tvis = _cctv_world_to_pixel(trail_arr, spec)
+                pts = [(float(tuv[j, 0]), float(tuv[j, 1]))
+                       for j in range(len(tuv)) if tvis[j]]
+                if len(pts) >= 2:
+                    draw.line(pts, fill=(50, 220, 50), width=2)
+
+            # Ego current position (green dot)
+            euv, evis = _cctv_world_to_pixel(
+                ego_xz.reshape(1, 2), spec)
+            if evis[0]:
+                eu, ev = float(euv[0, 0]), float(euv[0, 1])
+                r = 4
+                draw.ellipse([eu - r, ev - r, eu + r, ev + r],
+                             fill=(50, 220, 50), outline=(255, 255, 255))
+
+            # ── ego action waypoints at step t (orange) ──
+            if buf_actions is not None:
+                # Actions are camera-frame waypoints (future_length, 2)
+                # Convert to world frame using ego pose
+                act = buf_actions[t, env_idx]
+                wp_cam = act.reshape(-1, 2)           # (F, 2): x_cam, z_cam
+
+                # Simple conversion: rotate camera-frame to world frame
+                # The camera faces along the agent's forward direction.
+                # We approximate the agent heading from consecutive positions.
+                if t > 0:
+                    prev_xz = buf_cord[t - 1, env_idx, -2:]
+                    delta = ego_xz - prev_xz
+                    heading = math.atan2(delta[0], delta[1])  # atan2(dx, dz)
+                else:
+                    heading = 0.0
+
+                cos_h, sin_h = math.cos(heading), math.sin(heading)
+                # Rotate each waypoint from camera frame to world frame
+                # cam: x=right, z=forward -> world: x=right, z=forward
+                # rotated by heading
+                wp_world = np.zeros_like(wp_cam)
+                wp_world[:, 0] = (cos_h * wp_cam[:, 0]
+                                  + sin_h * wp_cam[:, 1]) + ego_xz[0]
+                wp_world[:, 1] = (-sin_h * wp_cam[:, 0]
+                                  + cos_h * wp_cam[:, 1]) + ego_xz[1]
+
+                wuv, wvis = _cctv_world_to_pixel(wp_world, spec)
+                # Connect ego to first waypoint, then waypoints
+                wp_pts = [(eu, ev)] if evis[0] else []
+                wp_pts += [(float(wuv[j, 0]), float(wuv[j, 1]))
+                           for j in range(len(wuv)) if wvis[j]]
+                if len(wp_pts) >= 2:
+                    draw.line(wp_pts, fill=(255, 160, 30), width=2)
+                for j in range(len(wuv)):
+                    if wvis[j]:
+                        wu, wv = float(wuv[j, 0]), float(wuv[j, 1])
+                        r = 3
+                        draw.ellipse([wu - r, wv - r, wu + r, wv + r],
+                                     fill=(255, 160, 30),
+                                     outline=(255, 255, 255))
+
+            # ── pedestrian trajectories up to t (magenta) ──
+            if ped_positions is not None and env_idx < len(ped_positions):
+                env_peds = ped_positions[env_idx]
+                if t < len(env_peds) and env_peds[t] is not None:
+                    curr_ped = env_peds[t]   # (N_ped, 2)
+                    if len(curr_ped) > 0:
+                        # Build per-pedestrian trail from steps 0..t
+                        n_peds = curr_ped.shape[0]
+                        for pi in range(n_peds):
+                            trail = []
+                            for s in range(t + 1):
+                                if (s < len(env_peds)
+                                        and env_peds[s] is not None
+                                        and pi < env_peds[s].shape[0]):
+                                    trail.append(env_peds[s][pi])
+                            if len(trail) >= 2:
+                                trail_arr = np.array(trail)
+                                puv, pvis = _cctv_world_to_pixel(
+                                    trail_arr, spec)
+                                pts = [(float(puv[j, 0]),
+                                        float(puv[j, 1]))
+                                       for j in range(len(puv))
+                                       if pvis[j]]
+                                if len(pts) >= 2:
+                                    draw.line(pts, fill=(220, 50, 220),
+                                              width=1)
+                            # Current position (white dot)
+                            puv, pvis = _cctv_world_to_pixel(
+                                curr_ped[pi:pi + 1], spec)
+                            if pvis[0]:
+                                pu = float(puv[0, 0])
+                                pv = float(puv[0, 1])
+                                r = 3
+                                draw.ellipse(
+                                    [pu - r, pv - r, pu + r, pv + r],
+                                    fill=(255, 255, 255),
+                                    outline=(220, 50, 220))
+
+            # ── text overlay ──
+            lines = [f"step {t + 1}/{T}"]
+            if buf_rewards is not None:
+                r_val = float(buf_rewards[t, env_idx])
+                cum_r += r_val
+                lines.append(f"r={r_val:+.2f}  cum={cum_r:+.1f}")
+            if is_done:
+                lines.append("SUCCESS" if is_terminated else "TRUNCATED")
+                cum_r = 0.0
+                ego_trail = []
+            for li, line in enumerate(lines):
+                y = 4 + li * 14
+                draw.text((5, y), line, fill=(0, 0, 0))
+                draw.text((4, y - 1), line, fill=(255, 255, 0))
+
+            # Legend (bottom-left)
+            legend_y = img_size - 56
+            for label, color in [("ego trail", (50, 220, 50)),
+                                 ("waypoints", (255, 160, 30)),
+                                 ("pedestrian", (220, 50, 220)),
+                                 ("goal", (50, 120, 255))]:
+                draw.rectangle([4, legend_y, 14, legend_y + 8],
+                               fill=color)
+                draw.text((18, legend_y - 2), label, fill=(0, 0, 0))
+                draw.text((17, legend_y - 3), label, fill=(255, 255, 255))
+                legend_y += 12
+
+            annotated.append(np.array(img, dtype=np.uint8))
+
+        if annotated:
+            env_frame_seqs.append(np.stack(annotated))
+
+    if not env_frame_seqs:
+        return
+
+    # ── tile into grid ──
+    max_T = max(seq.shape[0] for seq in env_frame_seqs)
+    H, W = env_frame_seqs[0].shape[1:3]
+    grid_H = grid_rows * H
+    grid_W = grid_cols * W
+
+    grid_frames = np.zeros((max_T, grid_H, grid_W, 3), dtype=np.uint8)
+    for idx, seq in enumerate(env_frame_seqs):
+        r, c = divmod(idx, grid_cols)
+        T_seq = seq.shape[0]
+        grid_frames[:T_seq, r * H:(r + 1) * H, c * W:(c + 1) * W] = seq
+        if T_seq < max_T:
+            grid_frames[T_seq:, r * H:(r + 1) * H,
+                        c * W:(c + 1) * W] = seq[-1]
+
+    # ── write video ──
+    if save_dir:
+        os.makedirs(save_dir, exist_ok=True)
+        base = os.path.join(save_dir, f"cctv_{iteration:04d}")
+        path = _write_video(grid_frames, base, fps)
+        if path:
+            print(f"  [cctv] saved {path}")
+            if wandb is not None:
+                try:
+                    wandb.log({
+                        "rollout/cctv_video": wandb.Video(
+                            path, fps=fps, format="mp4"),
+                    })
+                except Exception as e:
+                    print(f"  [cctv] wandb log failed: {e}")
 
 
 def log_ego_video_grid(
@@ -2078,14 +2341,6 @@ def log_ego_video_grid(
         Number of columns in the grid.  When *None*, defaults to
         ``ceil(sqrt(num_envs))`` for a roughly square layout.
     """
-    try:
-        import imageio  # noqa: F401
-    except ImportError:
-        print("  [video] imageio not found; "
-              "run: pip install imageio imageio-ffmpeg")
-        return
-
-    import tempfile
 
     num_steps, num_envs = buf_obs.shape[:2]
 
@@ -2244,14 +2499,7 @@ def log_ego_video(
                   for smoother playback. Annotations (reward, done, goal) are
                   shown only on the last substep frame of each policy step.
     """
-    try:
-        import imageio  # noqa: F401
-    except ImportError:
-        print("  [video] imageio not found; "
-              "run: pip install imageio imageio-ffmpeg")
-        return
 
-    import tempfile
 
     num_steps, num_envs = buf_obs.shape[:2]
 
@@ -2476,17 +2724,9 @@ def log_dino_pca_video_grid(
                      "BICUBIC", or "LANCZOS".  Default "LANCZOS" gives
                      the smoothest output.
     """
-    try:
-        import imageio  # noqa: F401
-    except ImportError:
-        print("  [dino-pca] imageio not found; "
-              "run: pip install imageio imageio-ffmpeg")
-        return
 
-    import tempfile
-    from PIL import Image as PILImage
     from sklearn.decomposition import PCA
-
+    from PIL import Image as PILImage
     resample_filter = getattr(PILImage, interpolation.upper(), PILImage.LANCZOS)
 
     num_steps, num_envs = buf_obs.shape[:2]
@@ -2687,6 +2927,7 @@ def log_weather_distributions(
 
     if save_dir is not None:
         os.makedirs(save_dir, exist_ok=True)
+        '''
         # remove previous snapshots
         import glob as _glob
         for old in _glob.glob(os.path.join(save_dir, "weather_dist_*.png")):
@@ -2694,6 +2935,7 @@ def log_weather_distributions(
                 os.remove(old)
             except OSError:
                 pass
+        '''
         path = os.path.join(save_dir, f"weather_dist_{iteration:04d}.png")
         fig.savefig(path, dpi=120)
         print(f"  → Weather distribution figure saved to {path}")
@@ -2708,6 +2950,86 @@ def log_weather_distributions(
                 f"weather/{name}_mean": vals.mean(),
                 f"weather/{name}_std": vals.std(),
             }, step=iteration)
+
+    plt.close(fig)
+
+
+# ── geodesic distance distribution tracking ──────────────────────────────
+
+class GeodesicTracker:
+    """Accumulates initial geodesic distances on episode resets.
+
+    Call ``update(infos)`` after each env step.  The tracker records one
+    sample per environment whenever the ``initial_geodesic_distance`` in the
+    info dict changes (i.e. on a new episode).
+    """
+
+    def __init__(self, num_envs: int):
+        self.num_envs = num_envs
+        self.samples: list[float] = []
+        self._last = [None] * num_envs
+
+    def update(self, infos):
+        """Extract initial geodesic distance from info dicts on change."""
+        for i, info in enumerate(infos):
+            d = info.get("initial_geodesic_distance")
+            if d is None or d <= 0:
+                continue
+            if d != self._last[i]:
+                self._last[i] = d
+                self.samples.append(d)
+
+    @property
+    def num_samples(self) -> int:
+        return len(self.samples)
+
+
+def log_geodesic_distributions(
+    tracker,
+    iteration=0,
+    save_dir=None,
+    wandb=None,
+):
+    """Plot histogram of initial geodesic distances across training episodes.
+
+    Saves to ``<save_dir>/geodesic_dist_<iteration>.png`` and logs to W&B
+    as ``rollout/geodesic_distributions``.
+    """
+    n = tracker.num_samples
+    if n == 0:
+        return
+
+    vals = np.array(tracker.samples)
+    mu, sigma = vals.mean(), vals.std()
+    lo, hi = 0.0, max(vals.max() * 1.05, 1.0)
+
+    fig, ax = plt.subplots(figsize=(6, 4))
+    nbins = min(40, max(5, n // 3))
+    ax.hist(vals, bins=nbins, range=(lo, hi), color="#5b9bd5",
+            edgecolor="white", linewidth=0.4)
+    ax.set_xlabel("Initial geodesic distance (m)")
+    ax.set_ylabel("Count")
+    ax.set_title(f"Geodesic distance distribution  (n={n}, iter {iteration})")
+    ax.text(0.97, 0.93, f"$\\mu$={mu:.1f}  $\\sigma$={sigma:.1f}",
+            transform=ax.transAxes, ha="right", va="top", fontsize=9,
+            bbox=dict(boxstyle="round,pad=0.2", fc="white", alpha=0.7))
+    fig.tight_layout()
+
+    if save_dir is not None:
+        os.makedirs(save_dir, exist_ok=True)
+        path = os.path.join(save_dir, f"geodesic_dist_{iteration:04d}.png")
+        fig.savefig(path, dpi=120)
+        print(f"  → Geodesic distribution figure saved to {path}")
+
+    if wandb is not None:
+        wandb.log({"rollout/geodesic_distributions": wandb.Image(fig)},
+                  step=iteration)
+        wandb.log({
+            "geodesic/initial_distance_mean": mu,
+            "geodesic/initial_distance_std": sigma,
+            "geodesic/initial_distance_min": float(vals.min()),
+            "geodesic/initial_distance_max": float(vals.max()),
+        }, step=iteration)
 
     plt.close(fig)
 

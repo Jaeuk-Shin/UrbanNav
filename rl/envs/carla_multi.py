@@ -26,7 +26,10 @@ import gymnasium as gym
 import carla
 from carla_utils.tf import UE
 from rl.envs.mpc.mpc import MPC
-from rl.envs.obstacle_manager import ObstacleManager, ObstacleConfig
+from rl.envs.obstacle_manager import (
+    ObstacleManager, ObstacleConfig, SpawnedObstacle,
+    BLOCKER_VEHICLE_BPS, BLOCKER_VEHICLE_FALLBACKS,
+)
 from rl.envs.pedestrian_manager import PedestrianManager, PedestrianConfig
 from rl.utils.geodesic import GeodesicDistanceField
 from rl.utils.geodesic_dynamic import DynamicGeodesicField
@@ -129,6 +132,7 @@ class CarlaMultiAgentEnv:
             use_mpc=False,
             dynamic_geo_mode='off',
             dynamic_geo_horizon=5.0,
+            scenario_dir: str | None = None,
             ):
         assert 1 <= num_agents <= 4, "Currently supports 1-4 agents (quadrants)"
 
@@ -158,8 +162,15 @@ class CarlaMultiAgentEnv:
         height = cfg.data.height
 
         # Per-agent gym spaces (for reference; the vectorised API stacks them)
+        # action space
         self.action_space = gym.spaces.Box(
             low=-100., high=100., shape=(self.future_length * 2,), dtype=np.float32)
+        # observation space
+        self.observation_space = gym.spaces.Dict({
+            'obs': gym.spaces.Box(0., 255., (self.history_length, height, width, 3), np.uint8),
+            'cord': gym.spaces.Box(-100., 100., (self.history_length * 2,), np.float32),
+            'goal': gym.spaces.Box(-100., 100., (2,), np.float32),
+        })
 
         # MPC: created once and kept alive across resets (JIT compiles on
         # first solve, so re-creating would incur non-negligible overhead).
@@ -173,15 +184,18 @@ class CarlaMultiAgentEnv:
         else:
             self._mpc = None
         self._last_mpc_solve_time = 0.0
-        self._last_sim_tick_time = 0.0
-        self.observation_space = gym.spaces.Dict({
-            'obs': gym.spaces.Box(0., 255., (self.history_length, height, width, 3), np.uint8),
-            'cord': gym.spaces.Box(-100., 100., (self.history_length * 2,), np.float32),
-            'goal': gym.spaces.Box(-100., 100., (2,), np.float32),
-        })
 
+        self._last_sim_tick_time = 0.0
+        
+        # for smooth rendering result
         self._collect_substep_frames = False
         self._substep_frames: List[list] = [[] for _ in range(num_agents)]
+
+        # CCTV cameras (persistent sensors for vis iterations)
+        self._cctv_cameras: List = []
+        self._cctv_queues: List = []
+        self._cctv_specs: List[dict] = []
+        self._cctv_frames: dict = {}           # agent_idx -> list of (H,W,3) uint8
 
         # CARLA handles (populated on reset)
         self.client = None
@@ -210,6 +224,13 @@ class CarlaMultiAgentEnv:
         self._obstacle_ids: List[int] = []
         self._challenge_actor_ids: List[List[int]] = [
             [] for _ in range(num_agents)]  # per-agent crosswalk challenge actors
+        # Blocked crosswalk OBBs from precomputed scenarios (per-agent)
+        self._blocked_cw_obbs: List[np.ndarray | None] = [
+            None] * num_agents  # each (M, 4, 2) std coords or None
+        # Precomputed obstacle corners for vis (per-agent); used instead of
+        # querying CARLA actors which may not be available before a tick.
+        self._precomp_obstacles: List[list] = [
+            [] for _ in range(num_agents)]  # each: list of {corners_std, center_std, scenario_type}
 
         # SFM pedestrians
         self.ped_mgr = PedestrianManager(pedestrian_config)
@@ -218,6 +239,7 @@ class CarlaMultiAgentEnv:
         # navmesh cache provides walkable triangles; distance fields per-episode)
         self._geo_grids: list = [None] * num_agents
         self._geo_dists: list = [None] * num_agents
+        self._geo_dist_max: list = [None] * num_agents  # max finite geodesic dist (off-navmesh clamp)
         self._geo_paths: list = [None] * num_agents   # traced geodesic paths (std coords)
 
         # Dynamic geodesic reward mode:
@@ -225,6 +247,7 @@ class CarlaMultiAgentEnv:
         #   'soft'      — soft-cost swept-volume heuristic (per-step 2D Dijkstra)
         #   'timespace' — exact time-space backward DP
         _valid = ('off', 'soft', 'timespace')
+        assert dynamic_geo_mode == 'off'            # currently turned off
         assert dynamic_geo_mode in _valid, f"dynamic_geo_mode must be one of {_valid}"
         self._dynamic_geo_mode = dynamic_geo_mode if pedestrian_config is not None else 'off'
         self._dynamic_geo_horizon = dynamic_geo_horizon  # seconds
@@ -240,395 +263,381 @@ class CarlaMultiAgentEnv:
         self._solvable_episodes = 0       # episodes confirmed solvable
         self._last_retries = [0] * num_agents  # retries for the most recent episode per agent
 
-    # ── VecCarlaEnv-compatible property ───────────────────────────────
+        # Obstacle spawn tracking (cumulative, reset with solvability stats)
+        self._obstacle_spawn_requested = 0
+        self._obstacle_spawn_failed = 0
 
+        # Precomputed scenario pool (DD-PPO style)
+        self._scenario_dir = scenario_dir
+        self._scenario_pools: list = [[] for _ in range(num_agents)]
+        self._scenario_cursors: list = [0] * num_agents
+        self._scenario_meta: dict | None = None
+
+    # ── VecCarlaEnv-compatible property ───────────────────────────────
     @property
     def num_envs(self):
         return self.num_agents
 
-    # ── Region splitting ──────────────────────────────────────────────
-
-    def _compute_regions(self, n_samples=1000, n_navmesh_samples=10000):
-        """Sample navmesh points to determine walkable extent, then split into
-        quadrants in UE coordinates (Location.x, Location.y).
-
-        Also caches navmesh points per region as a KD-tree (in standard
-        coordinates) for efficient navigable goal sampling.
-
-        Results are cached per town — repeated calls for the same map are free.
-        """
-        if self.quadrant_bounds is not None:
-            return
-
-        # Try precomputed cache first
-        used_cache = False
-        cache = self._navmesh_cache
-        if (cache is not None and self._current_town is not None
-                and cache.has_town(self._current_town)):
-            pts_ue_3d = cache.get_walkable_points_ue(self._current_town)
-            if pts_ue_3d is not None and len(pts_ue_3d) > 0:
-                points_ue = pts_ue_3d[:, :2]   # (N, 2) UE (x, y)
-                print(f"  [NavmeshCache] Using {len(points_ue)} cached "
-                      f"walkable points for region splitting")
-                used_cache = True
-
-        if not used_cache:
-            # Fallback: runtime sampling
-            total = max(n_samples, n_navmesh_samples)
-            points_ue = []
-            for _ in range(total):
-                loc = self.world.get_random_location_from_navigation()
-                if loc is not None:
-                    points_ue.append((loc.x, loc.y))
-            points_ue = np.array(points_ue)
-
-        center_x = np.median(points_ue[:, 0])
-        center_y = np.median(points_ue[:, 1])
-        # Small padding so boundary points are always included
-        x_min, x_max = points_ue[:, 0].min() - 1., points_ue[:, 0].max() + 1.
-        y_min, y_max = points_ue[:, 1].min() - 1., points_ue[:, 1].max() + 1.
-
-        # 4 quadrants: (ue_x_lo, ue_x_hi, ue_y_lo, ue_y_hi)
-        self.quadrant_bounds = [
-            (x_min, center_x, y_min, center_y),   # lower-left
-            (x_min, center_x, center_y, y_max),   # lower-right
-            (center_x, x_max, y_min, center_y),   # upper-left
-            (center_x, x_max, center_y, y_max),   # upper-right
-        ]
-
-        # Inner bounds: quadrant shrunk by margin so that both spawn and goal
-        # stay well inside the quadrant, avoiding edge-crossing geodesic paths.
-        m = self.quadrant_margin
-        self.quadrant_inner_bounds = [
-            (xlo + m, xhi - m, ylo + m, yhi - m)
-            for xlo, xhi, ylo, yhi in self.quadrant_bounds
-        ]
-
-        # Store full navmesh points for last-resort spawn fallback
-        self._all_navmesh_points_ue = points_ue  # (N, 2) UE (x, y)
-
-        # Use sidewalk-only points for goal sampling / KD-trees so that
-        # goals and spawns land on sidewalks rather than roads or grass.
-        sw_points_ue = None
-        if (cache is not None and self._current_town is not None
-                and cache.has_town(self._current_town)):
-            sw_pts_3d = cache.get_sidewalk_points_ue(self._current_town)
-            if sw_pts_3d is not None and len(sw_pts_3d) > 0:
-                sw_points_ue = sw_pts_3d[:, :2]
-                print(f"  [NavmeshCache] Using {len(sw_points_ue)} "
-                      f"sidewalk-only points for goal sampling KD-trees")
-        # Fall back to all walkable if no sidewalk data (old cache format)
-        if sw_points_ue is not None:
-            goal_points_ue = sw_points_ue
-        else:
-            print("  WARNING: No sidewalk-only points in cache — "
-                  "KD-trees will include roads. Rebuild cache with "
-                  "latest export_carla_navmesh.py")
-            goal_points_ue = points_ue
-
-        # Build per-region KD-trees in standard coordinates for goal sampling.
-        # Points are filtered to the *inner* bounds so that sampled goals
-        # are guaranteed to be at least `quadrant_margin` from the boundary.
-        # UE (x, y): standard (x_std, z_std) = (ue_y, ue_x)
-        self._navmesh_trees: List[cKDTree] = []
-        self._navmesh_points_std: List[np.ndarray] = []
-        self._navmesh_points_ue_full = []  # per-region, filtered by FULL bounds
-        for i in range(self.num_agents):
-            # Inner bounds (for goal sampling KD-tree) — sidewalk-only
-            xlo, xhi, ylo, yhi = self.quadrant_inner_bounds[i]
-            mask = (
-                (goal_points_ue[:, 0] >= xlo) & (goal_points_ue[:, 0] <= xhi) &
-                (goal_points_ue[:, 1] >= ylo) & (goal_points_ue[:, 1] <= yhi)
-            )
-            region_ue = goal_points_ue[mask]
-            # Convert to standard: x_std = ue_y, z_std = ue_x
-            region_std = np.stack([region_ue[:, 1], region_ue[:, 0]], axis=1)
-            self._navmesh_points_std.append(region_std)
-            self._navmesh_trees.append(cKDTree(region_std))
-
-            # Full bounds (for spawn fallback — relaxed constraint)
-            fxlo, fxhi, fylo, fyhi = self.quadrant_bounds[i]
-            fmask = (
-                (goal_points_ue[:, 0] >= fxlo) & (goal_points_ue[:, 0] <= fxhi) &
-                (goal_points_ue[:, 1] >= fylo) & (goal_points_ue[:, 1] <= fyhi)
-            )
-            self._navmesh_points_ue_full.append(goal_points_ue[fmask])
-
-        print(f"  Map bounds (UE): x=[{x_min:.1f}, {x_max:.1f}], "
-              f"y=[{y_min:.1f}, {y_max:.1f}]")
-        print(f"  Split center: ({center_x:.1f}, {center_y:.1f}), "
-              f"margin: {m:.1f}m")
-        for i in range(self.num_agents):
-            xlo, xhi, ylo, yhi = self.quadrant_bounds[i]
-            ilo, ihi, jlo, jhi = self.quadrant_inner_bounds[i]
-            print(f"  Region {i}: ue_x=[{xlo:.1f}, {xhi:.1f}], "
-                  f"ue_y=[{ylo:.1f}, {yhi:.1f}], "
-                  f"inner ue_x=[{ilo:.1f}, {ihi:.1f}], "
-                  f"inner ue_y=[{jlo:.1f}, {jhi:.1f}], "
-                  f"navmesh_pts={len(self._navmesh_points_std[i])}")
-
-    def _sample_location_in_region(self, region_idx, max_attempts=200):
-        """Sample a navmesh location for an agent spawn in *region_idx*.
-
-        Uses **progressive bound relaxation** so that a valid location is
-        always returned (never raises):
-
-        1. Inner bounds + navmesh cache
-        2. Inner bounds + per-region cached points (2D, z=0)
-        3. Full quadrant bounds + per-region cached points
-        4. Any cached navmesh point on the map
-        5. Live runtime random sampling (last resort)
-        """
-        inner = self.quadrant_inner_bounds[region_idx]
-        full = self.quadrant_bounds[region_idx]
-
-        # -- Tier 1: navmesh cache, inner bounds (best quality) --
-        # Prefer sidewalk-only points; fall back to all walkable.
-        cache = self._navmesh_cache
-        if (cache is not None and self._current_town is not None
-                and cache.has_town(self._current_town)):
-            pt = cache.sample_sidewalk_in_bounds_ue(self._current_town, inner)
-            if pt is not None:
-                return carla.Location(
-                    x=float(pt[0]), y=float(pt[1]), z=float(pt[2]))
-            # Relax to full quadrant bounds
-            pt = cache.sample_sidewalk_in_bounds_ue(self._current_town, full)
-            if pt is not None:
-                return carla.Location(
-                    x=float(pt[0]), y=float(pt[1]), z=float(pt[2]))
-
-        # -- Tier 2: per-region cached points, inner bounds ──
-        if (hasattr(self, '_navmesh_points_std')
-                and region_idx < len(self._navmesh_points_std)
-                and len(self._navmesh_points_std[region_idx]) > 0):
-            pts_std = self._navmesh_points_std[region_idx]
-            pt = pts_std[np.random.randint(len(pts_std))]
-            return carla.Location(x=float(pt[1]), y=float(pt[0]), z=0.0)
-
-        # -- Tier 3: per-region cached points, full quadrant bounds --
-        if (hasattr(self, '_navmesh_points_ue_full')
-                and region_idx < len(self._navmesh_points_ue_full)
-                and len(self._navmesh_points_ue_full[region_idx]) > 0):
-            pts = self._navmesh_points_ue_full[region_idx]
-            pt = pts[np.random.randint(len(pts))]
-            return carla.Location(x=float(pt[0]), y=float(pt[1]), z=0.0)
-
-        # -- Tier 4: any navmesh point on the whole map --
-        if (hasattr(self, '_all_navmesh_points_ue')
-                and len(self._all_navmesh_points_ue) > 0):
-            pt = self._all_navmesh_points_ue[
-                np.random.randint(len(self._all_navmesh_points_ue))]
-            print(f"  WARNING: region {region_idx} has no navmesh points "
-                  f"in bounds, using map-wide fallback")
-            return carla.Location(x=float(pt[0]), y=float(pt[1]), z=0.0)
-
-        # -- Tier 5: live runtime sampling (no cached data at all) --
-        x_min, x_max, y_min, y_max = full  # use full bounds, not inner
-        for _ in range(max_attempts):
-            loc = self.world.get_random_location_from_navigation()
-            if (loc is not None
-                    and x_min <= loc.x <= x_max
-                    and y_min <= loc.y <= y_max):
-                return loc
-        # Absolute last resort: any navmesh point, ignore bounds
-        for _ in range(max_attempts):
-            loc = self.world.get_random_location_from_navigation()
-            if loc is not None:
-                print(f"  WARNING: region {region_idx} spawn fell back "
-                      f"to unbounded navmesh sample")
-                return loc
-        raise RuntimeError(
-            f"Could not sample any navmesh location after "
-            f"{max_attempts * 2} attempts — is the navmesh loaded?")
-
-    # ── Coordinate helpers ────────────────────────────────────────────
-
-    def _camera2world(self, agent_idx, sensor_id='fcam'):
-        """
-        7-dim camera-to-world pose in standard coordinates
-            standard - x: right / z: front / y: down
-            UE       - x: front / y: right / z: up
-        """
-        r2w = np.array(self.robots[agent_idx].get_transform().get_matrix())     # robot-to-world (in UE coordinate system)
-        c2w = r2w @ self.c2r[agent_idx][sensor_id]                              # camera-to-world
-        c2w = UE @ c2w @ UE.T                                                   # to standard coorinate system (right-handed)
-        # 3d position of the camera in the (standard) world frame
-
-        xyz = c2w[:3, -1]               
-        q = R.from_matrix(c2w[:3, :3]).as_quat()        # [qx, qy, qz, qw]
-        return np.concatenate((xyz, q))
-
-    def _get_pose(self, agent_idx):
-        # standard camera-to-world
-        return np.copy(self.pose_buffers[agent_idx][-1])
-
-    def _get_xz(self, agent_idx):
-        """camera position on the standard xz-plane: [x_std, z_std]"""
-        p = self._get_pose(agent_idx)
-        return np.array([p[0], p[2]])
-
-    def _goal_cam(self, agent_idx):
-        """goal in the camera frame: [x_cam, z_cam]"""
-        goal_world = self.goal_globals[agent_idx] - self._get_xz(agent_idx)     # goal pos w.r.t. ego (but orientation w.r.t. world)
-        c2w_R = R.from_quat(self._get_pose(agent_idx)[3:])
-        g = c2w_R.inv().apply(np.array([goal_world[0], 0., goal_world[1]]))
-        return np.array([g[0], g[2]])
-
-    def _distance_to_goal(self, agent_idx):
-        g = self._goal_cam(agent_idx)
-        return float(np.sqrt(g @ g))
-
-    def _potential(self, agent_idx):
-        return -self._distance_to_goal(agent_idx)
+    # --- Commented out: unnecessary when precomputed scenarios are always used ---
+    # (quadrant bounds are loaded from scenario meta.json instead)
+    #
+    # def _compute_regions(self):
+    #     """Sample navmesh points to determine walkable extent, then split into
+    #     quadrants in UE coordinates (Location.x, Location.y).
+    #
+    #     Also caches navmesh points per region as a KD-tree (in standard
+    #     coordinates) for efficient navigable goal sampling.
+    #     """
+    #     if self.quadrant_bounds is not None:
+    #         return
+    #     cache = self._navmesh_cache
+    #     is_town_cached = (cache is not None) and (self._current_town is not None) and cache.has_town(self._current_town)
+    #     assert is_town_cached
+    #     pts_ue_3d = cache.get_walkable_points_ue(self._current_town)
+    #     assert (pts_ue_3d is not None) and (len(pts_ue_3d) > 0)
+    #     points_ue = pts_ue_3d[:, :2]
+    #     self._all_navmesh_points_ue = points_ue
+    #     center_x = np.median(points_ue[:, 0])
+    #     center_y = np.median(points_ue[:, 1])
+    #     x_min, x_max = points_ue[:, 0].min() - 1., points_ue[:, 0].max() + 1.
+    #     y_min, y_max = points_ue[:, 1].min() - 1., points_ue[:, 1].max() + 1.
+    #     self.quadrant_bounds = [
+    #         (x_min, center_x, y_min, center_y),
+    #         (x_min, center_x, center_y, y_max),
+    #         (center_x, x_max, y_min, center_y),
+    #         (center_x, x_max, center_y, y_max),
+    #     ]
+    #     m = self.quadrant_margin
+    #     self.quadrant_inner_bounds = [
+    #         (xlo + m, xhi - m, ylo + m, yhi - m)
+    #         for xlo, xhi, ylo, yhi in self.quadrant_bounds
+    #     ]
+    #     sw_points_ue = None
+    #     if cache is not None and self._current_town is not None and cache.has_town(self._current_town):
+    #         sw_pts_3d = cache.get_sidewalk_points_ue(self._current_town)
+    #         if sw_pts_3d is not None and len(sw_pts_3d) > 0:
+    #             sw_points_ue = sw_pts_3d[:, :2]
+    #     goal_points_ue = sw_points_ue if sw_points_ue is not None else points_ue
+    #     self._navmesh_trees = []
+    #     self._navmesh_points_std = []
+    #     self._navmesh_points_ue_full = []
+    #     for i in range(self.num_agents):
+    #         xlo, xhi, ylo, yhi = self.quadrant_inner_bounds[i]
+    #         mask = ((goal_points_ue[:, 0] >= xlo) & (goal_points_ue[:, 0] <= xhi) &
+    #                 (goal_points_ue[:, 1] >= ylo) & (goal_points_ue[:, 1] <= yhi))
+    #         region_ue = goal_points_ue[mask]
+    #         region_std = np.stack([region_ue[:, 1], region_ue[:, 0]], axis=1)
+    #         self._navmesh_points_std.append(region_std)
+    #         self._navmesh_trees.append(cKDTree(region_std))
+    #         fxlo, fxhi, fylo, fyhi = self.quadrant_bounds[i]
+    #         fmask = ((goal_points_ue[:, 0] >= fxlo) & (goal_points_ue[:, 0] <= fxhi) &
+    #                  (goal_points_ue[:, 1] >= fylo) & (goal_points_ue[:, 1] <= fyhi))
+    #         self._navmesh_points_ue_full.append(goal_points_ue[fmask])
+    # --- End commented out ---
 
     # ── Geodesic distance ─────────────────────────────────────────────
 
-    def _setup_ped_walkable_mesh(self):
-        """Pass walkable triangles + obstacle OBBs to the PedestrianManager.
-
-        This enables the boundary constraint that keeps SFM pedestrians
-        within the walkable region and away from obstacle interiors.
-        Requires a navmesh cache with walkable triangles.
-        """
-        if not self.ped_mgr.enabled:
-            return
-        if self._navmesh_cache is None or self._current_town is None:
-            return
-        walkable_tris = self._navmesh_cache.get_sidewalk_crosswalk_tris_std(
-            self._current_town)
-        if walkable_tris is None:
-            # Fall back to all walkable tris (old cache without per-area data)
-            walkable_tris = self._navmesh_cache.get_walkable_tris_std(
-                self._current_town)
-        if walkable_tris is None:
-            return
-
-        # Collect obstacle OBB corners in standard coords
-        layout = self.obstacle_mgr.get_obstacle_layout()
-        obs_corners = [o['corners_std'] for o in layout['obstacles']]
-
-        self.ped_mgr.set_walkable_mesh(walkable_tris,
-                                       obs_corners if obs_corners else None)
 
     def _init_geodesic_grid(self):
-        """Create per-quadrant rasterized geodesic grids from the navmesh cache.
+        """Create per-quadrant geodesic grid helpers from scenario metadata.
 
-        Each quadrant gets its own grid built from triangles within the
-        quadrant bounds plus ``quadrant_margin`` padding — much smaller
-        than the full map (~4x fewer cells for 4 quadrants).
-
-        Called once per map load.  If the cache does not contain walkable
-        triangles (old cache format), geodesic distance is unavailable and
-        the environment falls back to Euclidean potential.
+        With precomputed scenarios, only the coordinate system metadata
+        (origin, resolution, dimensions) is needed — no triangle loading
+        or rasterization.  The grid metadata comes from the scenario
+        meta.json written by ``generate_scenarios.py``.
         """
         self._geo_grids = [None] * self.num_agents
-        if self._navmesh_cache is None or self._current_town is None:
+        if self._scenario_meta is None:
             return
-        # Use sidewalk + crosswalk triangles only (exclude roads) so that
-        # geodesic paths stay on pedestrian-walkable surfaces.
-        all_tris = self._navmesh_cache.get_sidewalk_crosswalk_tris_std(
-            self._current_town)
-        if all_tris is None or len(all_tris) == 0:
-            # Fall back to all walkable tris (old cache without per-area data)
-            all_tris = self._navmesh_cache.get_walkable_tris_std(
-                self._current_town)
-            if all_tris is not None and len(all_tris) > 0:
-                print("  [Geodesic] WARNING: No per-area triangle data — "
-                      "using all walkable tris (may route through roads). "
-                      "Rebuild cache with latest export_carla_navmesh.py")
-        if all_tris is None or len(all_tris) == 0:
-            print("  [Geodesic] No walkable triangle data in cache — "
-                  "falling back to Euclidean potential")
-            return
-
-        geo_pad = self.quadrant_margin
+        grid_meta = self._scenario_meta.get('grid_metadata', {})
         for i in range(self.num_agents):
-            xlo, xhi, ylo, yhi = self.quadrant_bounds[i]
-            # Quadrant bounds are UE (x, y); triangles are standard (x_std, z_std).
-            # Standard ↔ UE:  x_std = ue_y,  z_std = ue_x
-            x_std_lo, x_std_hi = ylo - geo_pad, yhi + geo_pad
-            z_std_lo, z_std_hi = xlo - geo_pad, xhi + geo_pad
-
-            # Include any triangle with at least one vertex in the padded box
-            in_x = ((all_tris[:, :, 0] >= x_std_lo)
-                    & (all_tris[:, :, 0] <= x_std_hi))
-            in_z = ((all_tris[:, :, 1] >= z_std_lo)
-                    & (all_tris[:, :, 1] <= z_std_hi))
-            in_bounds = (in_x & in_z).any(axis=1)
-            quad_tris = all_tris[in_bounds]
-
-            if len(quad_tris) == 0:
-                print(f"  [Geodesic] Region {i}: no triangles — skipping")
+            key = f'q{i}'
+            if key not in grid_meta:
+                print(f"  [Geodesic] Region {i}: no grid metadata — skipping")
                 continue
-            print(f"  [Geodesic] Region {i}: "
-                  f"{len(quad_tris)}/{len(all_tris)} tris")
-            self._geo_grids[i] = GeodesicDistanceField(
-                quad_tris, resolution=1.0)
-            if self._dynamic_geo_mode == 'timespace':
-                self._dgeo_fields[i] = DynamicGeodesicField(
-                    self._geo_grids[i])
+            gm = grid_meta[key]
+            self._geo_grids[i] = GeodesicDistanceField.from_metadata(
+                x_min=gm['x_min'], z_min=gm['z_min'],
+                H=gm['H'], W=gm['W'], resolution=gm['resolution'])
 
-    def _update_geodesic(self, agent_idx):
-        """Recompute the geodesic distance field for *agent_idx*.
+    # --- Commented out: triangle-based geodesic grid construction ---
+    # (unnecessary when precomputed scenarios provide grid metadata)
+    # def _init_geodesic_grid_from_navmesh(self):
+    #     self._geo_grids = [None] * self.num_agents
+    #     if self._navmesh_cache is None or self._current_town is None:
+    #         return
+    #     all_tris = self._navmesh_cache.get_sidewalk_crosswalk_tris_std(
+    #         self._current_town)
+    #     if all_tris is None or len(all_tris) == 0:
+    #         all_tris = self._navmesh_cache.get_walkable_tris_std(
+    #             self._current_town)
+    #     if all_tris is None or len(all_tris) == 0:
+    #         return
+    #     geo_pad = self.quadrant_margin
+    #     for i in range(self.num_agents):
+    #         xlo, xhi, ylo, yhi = self.quadrant_bounds[i]
+    #         x_std_lo, x_std_hi = ylo - geo_pad, yhi + geo_pad
+    #         z_std_lo, z_std_hi = xlo - geo_pad, xhi + geo_pad
+    #         in_x = ((all_tris[:, :, 0] >= x_std_lo)
+    #                 & (all_tris[:, :, 0] <= x_std_hi))
+    #         in_z = ((all_tris[:, :, 1] >= z_std_lo)
+    #                 & (all_tris[:, :, 1] <= z_std_hi))
+    #         in_bounds = (in_x & in_z).any(axis=1)
+    #         quad_tris = all_tris[in_bounds]
+    #         if len(quad_tris) == 0:
+    #             continue
+    #         self._geo_grids[i] = GeodesicDistanceField(
+    #             quad_tris, resolution=1.0)
+    # --- End commented out ---
 
-        Called after each goal change (reset / auto-reset).  Stamps the
-        current obstacle layout onto the walkable grid and runs Dijkstra
-        from the agent's new goal.
+    # ── Precomputed scenario loading ─────────────────────────────────
+
+    def _load_scenario_pool(self):
+        """Load precomputed scenario file paths for the current town.
+
+        Populates ``_scenario_pools`` (per-quadrant lists of .npz paths)
+        and validates that precomputed quadrant bounds match computed ones.
         """
-        if self._geo_grids[agent_idx] is None:
-            self._geo_paths[agent_idx] = None
+        if self._scenario_dir is None:
             return
+        town_dir = pathlib.Path(self._scenario_dir) / self._current_town
+        if not town_dir.exists():
+            print(f"  [Scenarios] No precomputed scenarios for "
+                  f"{self._current_town}")
+            self._scenario_pools = [[] for _ in range(self.num_agents)]
+            return
+
+        meta_path = town_dir / 'meta.json'
+        if not meta_path.exists():
+            print(f"  [Scenarios] No meta.json in {town_dir}")
+            self._scenario_pools = [[] for _ in range(self.num_agents)]
+            return
+
+        with open(meta_path) as f:
+            self._scenario_meta = json.load(f)
+
+        # Load quadrant bounds from scenario metadata (replaces _compute_regions)
+        stored = self._scenario_meta['quadrant_bounds']
+        self.quadrant_bounds = [tuple(b) for b in stored[:self.num_agents]]
+        print(f"  [Scenarios] Loaded quadrant bounds from meta.json")
+        for i, (xlo, xhi, ylo, yhi) in enumerate(self.quadrant_bounds):
+            print(f"  Region {i}: ue_x=[{xlo:.1f}, {xhi:.1f}], "
+                  f"ue_y=[{ylo:.1f}, {yhi:.1f}]")
+
+        for i in range(self.num_agents):
+            q_dir = town_dir / f'q{i}'
+            if q_dir.exists():
+                paths = sorted(q_dir.glob('scenario_*.npz'))
+                random.shuffle(paths)
+                self._scenario_pools[i] = [str(p) for p in paths]
+            else:
+                self._scenario_pools[i] = []
+            print(f"  [Scenarios] Region {i}: "
+                  f"{len(self._scenario_pools[i])} precomputed scenarios")
+        self._scenario_cursors = [0] * self.num_agents
+
+    def _load_next_scenario(self, agent_idx: int) -> dict | None:
+        """
+        Load the next precomputed scenario for *agent_idx*.
+
+        Circular buffer with reshuffle on wrap.
+        """
+        pool = self._scenario_pools[agent_idx]
+        if not pool:
+            return None
+
+        cursor = self._scenario_cursors[agent_idx]
+        if cursor >= len(pool):
+            random.shuffle(pool)
+            cursor = 0
+
+        path = pool[cursor]
+        self._scenario_cursors[agent_idx] = cursor + 1
+
+        data = np.load(path, allow_pickle=False)
+        return {k: data[k] for k in data.files}
+
+    def _apply_precomputed_scenario(self, agent_idx: int,
+                                     scenario: dict | None = None) -> bool:
+        """
+        Apply a precomputed scenario to *agent_idx*.
+
+        Sets goal, installs the precomputed distance field, spawns CARLA
+        obstacle actors, and traces the geodesic path for vis.
+        Returns True on success, False to fall back to rejection sampling.
+
+        If *scenario* is provided it is used directly; otherwise the next
+        scenario is loaded from the pool (advancing the cursor).
+        """
+        if scenario is None:
+            scenario = self._load_next_scenario(agent_idx)
+        if scenario is None:
+            return False
+
+        # 1. Set goal
+        self.goal_globals[agent_idx] = scenario['goal_std'].astype(np.float64)
+        self._goal_methods[agent_idx] = str(scenario.get(
+            'goal_method', 'precomputed'))
+
+        # 2. Install precomputed distance field
+        dist_field = scenario['dist_field'].astype(np.float64)
         geo = self._geo_grids[agent_idx]
-        obstacles = self.obstacle_mgr.get_obstacle_layout().get('obstacles', [])
-        self._geo_dists[agent_idx] = geo.compute_distance_field(
-            self.goal_globals[agent_idx], obstacles)
-        # Trace the shortest geodesic path from spawn to goal for BEV vis
-        self._geo_paths[agent_idx] = geo.trace_path(
-            self._geo_dists[agent_idx], self._get_xz(agent_idx))
+
+        if geo is not None:
+            # Validate grid compatibility
+            if (geo._H, geo._W) != dist_field.shape:
+                print(f"  [Scenarios] Agent {agent_idx}: grid shape mismatch "
+                      f"({geo._H},{geo._W}) vs {dist_field.shape}, "
+                      f"falling back")
+                return False
+
+        self._geo_dists[agent_idx] = dist_field
+        self._cache_geo_dist_max(agent_idx, dist_field)
+
+        # 3. Spawn obstacles in CARLA
+        bp_ids = scenario.get('obstacle_bp_ids', np.array([], dtype='U64'))
+        positions = scenario.get('obstacle_positions_ue',
+                                 np.zeros((0, 3), dtype=np.float32))
+        yaws = scenario.get('obstacle_yaws_deg',
+                            np.array([], dtype=np.float32))
+        types = scenario.get('obstacle_scenario_types',
+                             np.array([], dtype='U32'))
+
+        spawned_ids = []
+        n_requested = len(bp_ids)
+        self._obstacle_spawn_requested += n_requested
+        _SPAWN_Z_OFFSETS = [5.0, 20.0, 50.0]
+        for j in range(n_requested):
+            bp_id = str(bp_ids[j])
+            scenario_type = str(types[j])
+            is_blocker = scenario_type in (
+                'blocked_crosswalk', 'crosswalk_challenge')
+
+            # Resolve blueprint (with fallback list for blockers)
+            bp_candidates = []
+            try:
+                bp_candidates.append(self.bp_lib.find(bp_id))
+            except (IndexError, RuntimeError):
+                pass
+            if is_blocker and not bp_candidates:
+                # Original blueprint missing — try all blocker blueprints
+                for alt_id in (BLOCKER_VEHICLE_BPS
+                               + BLOCKER_VEHICLE_FALLBACKS):
+                    if alt_id == bp_id:
+                        continue
+                    try:
+                        bp_candidates.append(self.bp_lib.find(alt_id))
+                    except (IndexError, RuntimeError):
+                        continue
+            if not bp_candidates:
+                print(f"  [Scenarios] Agent {agent_idx}: no blueprint "
+                      f"available for '{bp_id}', skipping obstacle {j}")
+                self._obstacle_spawn_failed += 1
+                continue
+
+            loc = carla.Location(
+                x=float(positions[j, 0]),
+                y=float(positions[j, 1]),
+                z=float(positions[j, 2]))
+            rot = carla.Rotation(yaw=float(yaws[j]))
+
+            # Try spawning at increasing z-offsets to clear static
+            # geometry (curbs, building overhangs), then teleport to
+            # ground level.  For blockers, also try alternative
+            # blueprints if the original fails at all heights.
+            actor = None
+            for bp in bp_candidates:
+                for z_off in _SPAWN_Z_OFFSETS:
+                    loc_up = carla.Location(loc.x, loc.y, loc.z + z_off)
+                    tf_up = carla.Transform(loc_up, rot)
+                    actor = self.world.try_spawn_actor(bp, tf_up)
+                    if actor is not None:
+                        break
+                if actor is not None:
+                    break
+
+            if actor is not None:
+                actor.set_simulate_physics(False)
+                actor.set_transform(carla.Transform(loc, rot))
+                self.obstacle_mgr.spawned.append(
+                    SpawnedObstacle(actor.id, scenario_type))
+                spawned_ids.append(actor.id)
+            else:
+                self._obstacle_spawn_failed += 1
+                print(f"  [Scenarios] Agent {agent_idx}: FAILED to spawn "
+                      f"'{bp_id}' at UE ({loc.x:.1f}, {loc.y:.1f}, "
+                      f"{loc.z:.1f}) yaw={float(yaws[j]):.1f}° "
+                      f"type={scenario_type} "
+                      f"(tried {len(bp_candidates)} bp × "
+                      f"{len(_SPAWN_Z_OFFSETS)} heights)")
+
+        self._challenge_actor_ids[agent_idx] = spawned_ids
+
+        # 3b. Store blocked crosswalk OBBs for vis (mark crosswalks red)
+        blocked_cws = scenario.get('blocked_crosswalk_obbs_std')
+        if blocked_cws is not None and len(blocked_cws) > 0:
+            self._blocked_cw_obbs[agent_idx] = np.asarray(
+                blocked_cws, dtype=np.float64)
+        else:
+            self._blocked_cw_obbs[agent_idx] = None
+
+        # 4. Trace geodesic path for BEV vis
+        if geo is not None:
+            start_std = scenario['start_std'].astype(np.float64)
+            self._geo_paths[agent_idx] = geo.trace_path(
+                dist_field, start_std)
+        else:
+            self._geo_paths[agent_idx] = None
+
+        # 5. Update stats (precomputed = always solvable)
+        self._last_retries[agent_idx] = 0
+        self._solvable_episodes += 1
+
+        return True
+
+    # ── Geodesic distance field ──────────────────────────────────────
+
+    _OFF_NAVMESH_MARGIN = 2.0   # metres beyond max reachable distance
+
+    def _cache_geo_dist_max(self, agent_idx, dist_field: np.ndarray):
+        """Cache the maximum finite geodesic distance for off-navmesh clamping."""
+        finite = dist_field[np.isfinite(dist_field)]
+        if finite.size > 0:
+            self._geo_dist_max[agent_idx] = (
+                float(finite.max()) + self._OFF_NAVMESH_MARGIN)
+        else:
+            self._geo_dist_max[agent_idx] = None
 
     def _geodesic_potential(self, agent_idx):
         """Potential based on geodesic (obstacle-aware) distance.
 
-        Falls back to Euclidean potential when geodesic data is unavailable.
+        When the agent is off the walkable navmesh (geodesic query returns
+        inf), clamps to ``-(max_finite_distance + margin)`` so that leaving
+        the navmesh always incurs a sharp penalty rather than silently
+        switching to a Euclidean metric.
+
+        Falls back to Euclidean potential only when no geodesic grid exists.
         """
         geo = self._geo_grids[agent_idx]
         if geo is not None and self._geo_dists[agent_idx] is not None:
             d = geo.query(self._geo_dists[agent_idx], self._get_xz(agent_idx))
             if np.isfinite(d):
                 return -d
+            # Off-navmesh: clamp to worst reachable distance + margin
+            if self._geo_dist_max[agent_idx] is not None:
+                return -self._geo_dist_max[agent_idx]
         return self._potential(agent_idx)
 
     def _geodesic_distance_to_goal(self, agent_idx):
-        """Geodesic distance to goal, or Euclidean if unavailable."""
+        """Geodesic distance to goal, or clamped max if off-navmesh."""
         geo = self._geo_grids[agent_idx]
         if geo is not None and self._geo_dists[agent_idx] is not None:
             d = geo.query(self._geo_dists[agent_idx], self._get_xz(agent_idx))
             if np.isfinite(d):
                 return d
+            if self._geo_dist_max[agent_idx] is not None:
+                return self._geo_dist_max[agent_idx]
         return self._distance_to_goal(agent_idx)
-
-    def _is_episode_solvable(self, agent_idx):
-        """Check whether the current episode is solvable.
-
-        An episode is unsolvable if:
-        1. The goal is geodesically unreachable (disconnected mesh), or
-        2. The geodesic distance exceeds the agent's travel budget
-           (max_speed * sqrt(2) * max_episode_steps).
-
-        Returns ``(solvable, reason)`` where *reason* is ``''`` when
-        solvable, or a short description of why it's not.
-        """
-        geo = self._geo_grids[agent_idx]
-        if geo is None or self._geo_dists[agent_idx] is None:
-            # No geodesic grid available — can't check, assume solvable
-            return True, ''
-        d = geo.query(self._geo_dists[agent_idx], self._get_xz(agent_idx))
-        if not np.isfinite(d):
-            return False, 'unreachable'
-        budget = self.max_speed * math.sqrt(2) * self.max_episode_steps
-        if d > budget:
-            return False, f'too_far(geodesic={d:.1f}m > budget={budget:.1f}m)'
-        return True, ''
 
     # ── Sensor data ───────────────────────────────────────────────────
 
@@ -668,141 +677,6 @@ class CarlaMultiAgentEnv:
             self.pose_buffers[agent_idx].append(pose)
             self.rgb_buffers[agent_idx].append(rgb)
 
-    # ── Goal sampling ─────────────────────────────────────────────────
-
-    def _sample_goal(self, agent_idx):
-        """
-        Sample a navigable goal from the cached navmesh KD-tree.
-
-        Queries all navmesh points within r_max of the agent, filters to
-        those at least r_min away (annulus), and picks one uniformly at
-        random.
-
-        Note: crosswalk-challenge goals are handled separately in the
-        auto-reset flow (before agent teleportation) and bypass this method.
-        """
-        # --- Normal goal sampling ---
-        r_min, r_max = 0.8 * self.goal_range, self.goal_range   # inner & outer radius of the annulus
-        xz = self._get_xz(agent_idx)        # standard world coordinate
-
-        tree = self._navmesh_trees[agent_idx]
-        pts = self._navmesh_points_std[agent_idx]
-
-        # All cached navmesh points within r_max
-        idxs = tree.query_ball_point(xz, r_max)
-        if idxs:
-            candidates = pts[idxs]
-            dists = np.linalg.norm(candidates - xz, axis=1)
-            annulus_mask = dists >= r_min
-            candidates = candidates[annulus_mask]
-
-        if idxs and len(candidates) > 0:
-            choice = candidates[np.random.randint(len(candidates))]
-            self.goal_globals[agent_idx] = choice
-            self._goal_methods[agent_idx] = 'navmesh_annulus'
-        else:
-            # Fallback: relax distance constraints but stay on cached
-            # sidewalk/navmesh points (never use unvalidated random sampling).
-            print(f'port {self.port} ({self._current_town}) agent {agent_idx}: '
-                  f'No navmesh points in annulus [{r_min:.1f}, {r_max:.1f}]m, '
-                  f'relaxing distance constraints')
-            self._goal_methods[agent_idx] = 'navmesh_relaxed'
-
-            if idxs:
-                # Points within r_max exist but none outside r_min — use
-                # the farthest available point within r_max.
-                nearby = pts[idxs]
-                dists = np.linalg.norm(nearby - xz, axis=1)
-                self.goal_globals[agent_idx] = nearby[np.argmax(dists)]
-            elif len(pts) > 0:
-                # No points within r_max — pick a sidewalk point closest to
-                # the target distance (midpoint of the original annulus).
-                target_dist = (r_min + r_max) / 2
-                dists = np.linalg.norm(pts - xz, axis=1)
-                self.goal_globals[agent_idx] = pts[
-                    np.argmin(np.abs(dists - target_dist))]
-            else:
-                # No cached sidewalk points at all (shouldn't happen with a
-                # valid cache).  Fall back to random geometric sampling as
-                # an absolute last resort.
-                print(f'  WARNING: agent {agent_idx} has no cached navmesh '
-                      f'points — using unvalidated random goal')
-                self._goal_methods[agent_idx] = 'random_fallback'
-                delta_xz = sample_point_from_annulus(r_min, r_max)
-                self.goal_globals[agent_idx] = xz + delta_xz
-
-    def _sample_solvable_goal(self, agent_idx):
-        """Sample a goal and verify solvability, retrying up to
-        ``_max_goal_retries`` times.
-
-        On each attempt a new goal is sampled via ``_sample_goal``, the
-        geodesic field is recomputed, and ``_is_episode_solvable`` is
-        checked.  If all attempts fail the last sampled goal is kept
-        (best-effort) and the episode is counted as unsolvable.
-
-        Updates ``_last_retries``, ``_goal_retries_total``,
-        ``_solvable_episodes``, and ``_unsolvable_episodes``.
-        """
-        retries = 0
-        for attempt in range(self._max_goal_retries + 1):
-            self._sample_goal(agent_idx)
-            self._update_geodesic(agent_idx)
-            solvable, reason = self._is_episode_solvable(agent_idx)
-            if solvable:
-                break
-            retries += 1
-            if attempt < self._max_goal_retries:
-                print(f'  Agent {agent_idx}: goal unsolvable ({reason}), '
-                      f'resampling (attempt {attempt + 2}/{self._max_goal_retries + 1})')
-
-        self._last_retries[agent_idx] = retries
-        self._goal_retries_total += retries
-        if solvable:
-            self._solvable_episodes += 1
-        else:
-            self._unsolvable_episodes += 1
-            print(f'  Agent {agent_idx}: WARNING — episode unsolvable after '
-                  f'{self._max_goal_retries + 1} attempts ({reason}), '
-                  f'proceeding anyway')
-
-    def _try_crosswalk_or_fallback(self, agent_idx, crosswalk_spawns,
-                                   crosswalk_goal_std):
-        """Set a crosswalk-challenge goal and check solvability.
-
-        If the crosswalk goal is unsolvable, destroy the challenge actors
-        and fall back to ``_sample_solvable_goal`` with normal goal
-        sampling.
-
-        Parameters
-        ----------
-        agent_idx : int
-        crosswalk_spawns : dict
-            Mutable mapping — entry for *agent_idx* is removed on fallback.
-        crosswalk_goal_std : (2,) array
-            Goal in standard coordinates from the crosswalk challenge.
-        """
-        self.goal_globals[agent_idx] = crosswalk_goal_std
-        self._goal_methods[agent_idx] = 'crosswalk_challenge'
-        self.obstacle_mgr._region_scenarios.setdefault(
-            agent_idx, []).append('crosswalk_challenge')
-        self._update_geodesic(agent_idx)
-        solvable, reason = self._is_episode_solvable(agent_idx)
-        if solvable:
-            self._last_retries[agent_idx] = 0
-            self._solvable_episodes += 1
-            return
-
-        # Crosswalk challenge produced an unsolvable episode — tear it
-        # down and fall back to normal goal sampling.
-        print(f'  Agent {agent_idx}: crosswalk challenge unsolvable '
-              f'({reason}), falling back to normal goal')
-        if self._challenge_actor_ids[agent_idx]:
-            self.obstacle_mgr.destroy_actors(
-                self._challenge_actor_ids[agent_idx])
-            self._challenge_actor_ids[agent_idx] = []
-        crosswalk_spawns.pop(agent_idx, None)
-        self._sample_solvable_goal(agent_idx)
-
     # ── Observation / info builders ───────────────────────────────────
 
     def _get_observation(self, agent_idx):
@@ -838,12 +712,11 @@ class CarlaMultiAgentEnv:
         keys = obs_list[0].keys()
         return {k: np.stack([o[k] for o in obs_list]) for k in keys}
 
-    # ── Weather randomisation ─────────────────────────────────────────
+    # ── Weather randomization ─────────────────────────────────────────
 
     def _randomize_weather(self):
         """Sample random weather and sun position for the current episode."""
-        if not self.randomize_weather:
-            return
+        
         params = dict(
             cloudiness=float(np.random.uniform(0, 90)),
             precipitation=float(np.random.uniform(0, 80)),
@@ -857,6 +730,7 @@ class CarlaMultiAgentEnv:
         )
         self._current_weather = params
         self.world.set_weather(carla.WeatherParameters(**params))
+        return
 
     # ── Map loading ────────────────────────────────────────────────────
 
@@ -881,129 +755,7 @@ class CarlaMultiAgentEnv:
             # Pre-load navmesh cache for the new town
             if self._navmesh_cache is not None:
                 self._navmesh_cache.load(town)
-
-    def _full_reload(self):
-        """Tear down all agents, load a new map, and respawn everything.
-
-        Called during step() when map_change_interval is reached.
-        After this call all per-agent state (buffers, goals, counters)
-        is fresh — callers should return the new observations directly.
-        """
-        # ── Destroy actors ──
-        for agent_sensors in self.sensors:
-            for s in agent_sensors:
-                try:
-                    s.stop()
-                    s.destroy()
-                except Exception:
-                    pass
-        if self.all_actor_ids:
-            try:
-                self.client.apply_batch(
-                    [carla.command.DestroyActor(x) for x in self.all_actor_ids])
-            except Exception:
-                pass
-
-        # ── Load new map ──
-        self._load_town()
-        self.world = self.client.get_world()
-
-        # Re-apply world settings (load_world resets them)
-        settings = self.world.get_settings()
-        settings.synchronous_mode = True
-        settings.fixed_delta_seconds = self.dt
-        settings.max_substeps = min(16, math.ceil(self.dt / 0.01))
-        settings.max_substep_delta_time = self.dt / settings.max_substeps + 1e-5
-        self.world.apply_settings(settings)
-        self._randomize_weather()
-
-        self.bp_lib = self.world.get_blueprint_library()
-        self.tm = self.client.get_trafficmanager(self.port + 6000)
-        self.tm.set_synchronous_mode(True)
-
-        # ── Recompute regions for the new map ──
-        self._compute_regions()
-
-        # ── Geodesic distance grid for the new map ──
-        self._init_geodesic_grid()
-
-        # ── Re-spawn obstacles for new map ──
-        self.obstacle_mgr.initialize(self.world, self.bp_lib,
-                                     self.quadrant_bounds,
-                                     navmesh_cache=self._navmesh_cache,
-                                     town=self._current_town)
-        self._obstacle_ids = self.obstacle_mgr.spawn_all_regions(
-            self.num_agents)
-
-        # ── Re-spawn SFM pedestrians for new map ──
-        self.ped_mgr.initialize(self.world, self.bp_lib,
-                                self.quadrant_bounds,
-                                navmesh_cache=self._navmesh_cache,
-                                town=self._current_town)
-
-        # ── Build punctured walkable mesh for pedestrian boundary constraint ──
-        self._setup_ped_walkable_mesh()
-
-        # ── Re-initialise per-agent state ──
-        self.sensor_queues = [{} for _ in range(self.num_agents)]
-        self.c2r = [{} for _ in range(self.num_agents)]
-        self.sensors = [[] for _ in range(self.num_agents)]
-        self.all_actor_ids = (list(self._obstacle_ids)
-                              + self.ped_mgr.get_actor_ids())
-
-        # Pre-decide crosswalk challenges for new map
-        # (old challenge actors were destroyed with the map change above)
-        crosswalk_spawns = {}
-        self._challenge_actor_ids = [[] for _ in range(self.num_agents)]
-        cfg = self.obstacle_mgr.config
-        if cfg is not None:
-            for i in range(self.num_agents):
-                if random.random() < cfg.p_crosswalk_challenge:
-                    bounds = self.quadrant_inner_bounds[i]
-                    result = self.obstacle_mgr.setup_crosswalk_challenge(
-                        bounds)
-                    if result is not None:
-                        agent_pos, goal_std, actor_ids = result
-                        crosswalk_spawns[i] = (agent_pos, goal_std)
-                        self._challenge_actor_ids[i] = actor_ids
-
-        walker_bps = self.bp_lib.filter('walker.pedestrian.*')
-        for i in range(self.num_agents):
-            if i in crosswalk_spawns:
-                pos = crosswalk_spawns[i][0]
-                loc = carla.Location(
-                    x=float(pos[0]), y=float(pos[1]),
-                    z=float(pos[2]) + 2.0)
-            else:
-                loc = self._sample_location_in_region(i)
-                loc.z += 2.0
-            spawn_tf = carla.Transform()
-            spawn_tf.location = loc
-            robot = self.world.try_spawn_actor(random.choice(walker_bps), spawn_tf)
-            assert robot is not None, f"Failed to spawn agent {i} after map reload"
-            self.robots[i] = robot
-            self.all_actor_ids.append(robot.id)
-
-        for i in range(self.num_agents):
-            self._spawn_sensors_for_agent(i)
-
-        self.world.tick()
-
-        for i in range(self.num_agents):
-            self._initialize_buffer(i)
-            if i in crosswalk_spawns:
-                _, goal_std = crosswalk_spawns[i]
-                self.goal_globals[i] = goal_std
-                self._goal_methods[i] = 'crosswalk_challenge'
-                self.obstacle_mgr._region_scenarios.setdefault(
-                    i, []).append('crosswalk_challenge')
-            else:
-                self._sample_goal(i)
-            self._update_geodesic(i)
-            self.initial_distances[i] = self._distance_to_goal(i)
-            self.path_lengths[i] = 0.0
-            self.step_counts[i] = 0
-
+            
     # ── Spawn / destroy ───────────────────────────────────────────────
 
     def _destroy_stale_actors(self):
@@ -1046,19 +798,6 @@ class CarlaMultiAgentEnv:
             self.sensors[agent_idx].append(sensor)
             self.all_actor_ids.append(sensor.id)
 
-    def _reset_agent_pose(self, agent_idx):
-        """Teleport an existing agent to a new spawn point in its region."""
-        loc = self._sample_location_in_region(agent_idx)
-        loc.z += 2.0      # prevent ground collision
-        tf = carla.Transform()
-        tf.location = loc
-        self.robots[agent_idx].set_transform(tf)
-
-    # ── Public API ────────────────────────────────────────────────────
-
-    def set_collect_substep_frames(self, enabled: bool):
-        self._collect_substep_frames = enabled
-
     def reset(self):
         """Full reset: connect to CARLA, split map, spawn all agents."""
         # TODO: check if this can be improved in terms of efficiency?
@@ -1082,68 +821,62 @@ class CarlaMultiAgentEnv:
         settings.max_substeps = min(16, math.ceil(self.dt / 0.01))
         settings.max_substep_delta_time = self.dt / settings.max_substeps + 1e-5
         self.world.apply_settings(settings)
-        self._randomize_weather()
+
+        if self.randomize_weather:
+            self._randomize_weather()
 
         self.bp_lib = self.world.get_blueprint_library()
 
-        # ── Region splitting (cached per town) ──
-        self._compute_regions()
+        # ── Precomputed scenario pool (loads quadrant bounds from meta.json) ──
+        self._load_scenario_pool()
+        assert self._scenario_dir is not None and any(self._scenario_pools), \
+            "Precomputed scenarios are required (pass --scenario_dir)"
 
-        # ── Geodesic distance grid (from navmesh cache) ──
+        # ── Geodesic grid coordinate system (from scenario metadata) ──
         self._init_geodesic_grid()
 
-        # ── Procedural obstacles ──
+        # ── Obstacle manager (world/blueprint refs for precomputed spawning) ──
         self.obstacle_mgr.initialize(self.world, self.bp_lib,
                                      self.quadrant_bounds,
                                      navmesh_cache=self._navmesh_cache,
                                      town=self._current_town)
-        self._obstacle_ids = self.obstacle_mgr.spawn_all_regions(
-            self.num_agents)
-        self.all_actor_ids.extend(self._obstacle_ids)
+        # NOTE: do NOT call spawn_all_regions() here — precomputed scenarios
+        # specify their own obstacle placements which are spawned by
+        # _apply_precomputed_scenario().  The old online generator uses
+        # different placement logic (blocker at crosswalk centre) that
+        # conflicts with the precomputed distance fields.
 
         # ── SFM pedestrians ──
         self.ped_mgr.initialize(self.world, self.bp_lib,
                                 self.quadrant_bounds,
                                 navmesh_cache=self._navmesh_cache,
-                                town=self._current_town)
+                                town=self._current_town,
+                                obstacle_layout=self.obstacle_mgr.get_obstacle_layout())
         self.all_actor_ids.extend(self.ped_mgr.get_actor_ids())
 
         # ── Per-agent state ──
-        self.rgb_buffers = [deque(maxlen=self.history_length)
-                            for _ in range(self.num_agents)]
-        self.pose_buffers = [deque(maxlen=self.history_length)
-                             for _ in range(self.num_agents)]
+        self.rgb_buffers = [deque(maxlen=self.history_length) for _ in range(self.num_agents)]
+        self.pose_buffers = [deque(maxlen=self.history_length) for _ in range(self.num_agents)]
         self.sensor_queues = [{} for _ in range(self.num_agents)]
         self.c2r = [{} for _ in range(self.num_agents)]
         self.sensors = [[] for _ in range(self.num_agents)]
         self.all_actor_ids = []
 
-        # ── Pre-decide crosswalk challenges (need spawn pos before creating agents) ──
-        crosswalk_spawns = {}  # agent_idx -> (agent_pos_ue, goal_std)
+        # ── Load precomputed scenarios ──
+        precomp_scenarios = {}  # agent_idx -> scenario dict
         self._challenge_actor_ids = [[] for _ in range(self.num_agents)]
-        cfg = self.obstacle_mgr.config
-        if cfg is not None:
-            for i in range(self.num_agents):
-                if random.random() < cfg.p_crosswalk_challenge:
-                    bounds = self.quadrant_inner_bounds[i]
-                    result = self.obstacle_mgr.setup_crosswalk_challenge(
-                        bounds)
-                    if result is not None:
-                        agent_pos, goal_std, actor_ids = result
-                        crosswalk_spawns[i] = (agent_pos, goal_std)
-                        self._challenge_actor_ids[i] = actor_ids
+        for i in range(self.num_agents):
+            scenario = self._load_next_scenario(i)
+            if scenario is not None:
+                precomp_scenarios[i] = scenario
 
         # ── Spawn walkers (one per region) ──
         walker_bps = self.bp_lib.filter('walker.pedestrian.*')
         for i in range(self.num_agents):
-            if i in crosswalk_spawns:
-                pos = crosswalk_spawns[i][0]
-                loc = carla.Location(
-                    x=float(pos[0]), y=float(pos[1]),
-                    z=float(pos[2]) + 2.0)
-            else:
-                loc = self._sample_location_in_region(i)
-                loc.z += 2.0
+            assert i in precomp_scenarios, f"No precomputed scenario for agent {i}"
+            pos = precomp_scenarios[i]['start_ue']
+            loc = carla.Location(x=float(pos[0]), y=float(pos[1]), z=float(pos[2]) + 2.0)
+
             spawn_tf = carla.Transform()
             spawn_tf.location = loc
 
@@ -1163,20 +896,18 @@ class CarlaMultiAgentEnv:
         # ── Initialise buffers & goals ──
         for i in range(self.num_agents):
             self._initialize_buffer(i)
-            if i in crosswalk_spawns:
-                _, goal_std = crosswalk_spawns[i]
-                self._try_crosswalk_or_fallback(
-                    i, crosswalk_spawns, goal_std)
-            else:
-                self._sample_solvable_goal(i)
-            self.initial_distances[i] = self._distance_to_goal(i)
-            self.initial_geodesic_distances[i] = \
-                self._geodesic_distance_to_goal(i)
-            self.path_lengths[i] = 0.0
-            self.step_counts[i] = 0
+            applied = self._apply_precomputed_scenario(
+                i, precomp_scenarios[i])
+            assert applied, f"Failed to apply precomputed scenario for agent {i}"
 
-        obs = self._stack_obs(
-            [self._get_observation(i) for i in range(self.num_agents)])
+            self.initial_distances[i] = self._distance_to_goal(i)
+            self.initial_geodesic_distances[i] = self._geodesic_distance_to_goal(i)
+            self.path_lengths[i], self.step_counts[i] = 0.0, 0.0
+
+        # Tick once so spawned obstacle actors are registered and queryable
+        self.world.tick()
+
+        obs = self._stack_obs([self._get_observation(i) for i in range(self.num_agents)])
         infos = [self._get_info(i) for i in range(self.num_agents)]
         return obs, infos
 
@@ -1186,7 +917,7 @@ class CarlaMultiAgentEnv:
 
         Parameters
         ----------
-        actions : (num_agents, future_length * 2)  float32
+        actions : (num_agents, future_length * 2)
             Per-agent waypoints in the camera frame, flattened from
             (future_length, 2) where each row is [x_cam, z_cam].
 
@@ -1212,6 +943,9 @@ class CarlaMultiAgentEnv:
         # Dynamic geodesic: forward-predict pedestrian trajectories and
         # recompute distance fields accounting for predicted pedestrians.
         _dyn_V = None            # 3-D value field for timespace mode
+
+        assert self._dynamic_geo_mode == 'off'
+        '''
         if self._dynamic_geo_mode != 'off' and self.ped_mgr.enabled:
             horizon_steps = max(1, int(self._dynamic_geo_horizon / self.dt))
             ped_traj_std = self.ped_mgr.predict_trajectories_std(
@@ -1223,6 +957,7 @@ class CarlaMultiAgentEnv:
                     if geo is not None and geo._static_walkable is not None:
                         self._geo_dists[i] = geo.compute_distance_field_dynamic(
                             self.goal_globals[i], ped_traj_std)
+                        self._cache_geo_dist_max(i, self._geo_dists[i])
             elif self._dynamic_geo_mode == 'timespace':
                 # Compute 3-D value field V[t, r, c] per agent
                 _dyn_V = [None] * N
@@ -1232,15 +967,15 @@ class CarlaMultiAgentEnv:
                         _dyn_V[i] = dgeo.compute(
                             self._geo_dists[i], ped_traj_std)
                 self._dgeo_V = _dyn_V
-
+        '''
         # phi0: potential before action
         if _dyn_V is not None:
             phi0 = []
             for i in range(N):
                 if _dyn_V[i] is not None:
-                    d = self._dgeo_fields[i].query(
-                        _dyn_V[i], self._get_xz(i), t=0)
-                    phi0.append(-d if np.isfinite(d) else self._potential(i))
+                    d = self._dgeo_fields[i].query(_dyn_V[i], self._get_xz(i), t=0)
+                    phi0.append(-d if np.isfinite(d)
+                                else self._geodesic_potential(i))
                 else:
                     phi0.append(self._geodesic_potential(i))
         else:
@@ -1314,9 +1049,8 @@ class CarlaMultiAgentEnv:
 
             # phi1: potential after action
             if _dyn_V is not None and _dyn_V[i] is not None:
-                d1 = self._dgeo_fields[i].query(
-                    _dyn_V[i], post_xz, t=self.n_skips)
-                phi1 = -d1 if np.isfinite(d1) else self._potential(i)
+                d1 = self._dgeo_fields[i].query(_dyn_V[i], post_xz, t=self.n_skips)
+                phi1 = -d1 if np.isfinite(d1) else self._geodesic_potential(i)
             else:
                 phi1 = self._geodesic_potential(i)
             dist = self._distance_to_goal(i)                    # Euclidean (for success check)
@@ -1377,6 +1111,11 @@ class CarlaMultiAgentEnv:
                     x_sol, u_sol = self._last_mpc_solutions[i]
                     info['mpc_x_sol'] = x_sol    # (horizon+1, 3)
                     info['mpc_u_sol'] = u_sol    # (horizon, 2)
+                # Pedestrian positions for CCTV overlay
+                ped_layout = self.ped_mgr.get_pedestrian_layout()
+                ped_pos = [p['position_std'] for p in ped_layout.get('pedestrians', [])]
+                info['pedestrian_positions_std'] = (
+                    np.stack(ped_pos) if ped_pos else np.empty((0, 2)))
             infos.append(info)
 
             if terminated or truncated:
@@ -1396,35 +1135,6 @@ class CarlaMultiAgentEnv:
         if reset_set:
             self._total_episodes += len(reset_set)
 
-            # Check if a map change is due
-            if (self.towns and self.map_change_interval > 0
-                    and self._total_episodes >= self.map_change_interval):
-                self._total_episodes = 0
-                # Capture terminal obs for ALL non-terminated agents before reload
-                for i in range(N):
-                    if i not in reset_set and not terminateds[i]:
-                        terminal_obs[i] = self._get_observation(i)
-                self._full_reload()
-                # All agents were force-reset; mark all as truncated
-                truncateds[:] = True
-                obs = self._stack_obs(
-                    [self._get_observation(i) for i in range(N)])
-                # Keep infos from the terminal step (contains is_success,
-                # distance_to_goal, etc.) — don't overwrite with post-reset info
-                _t_reset = time.perf_counter() - _t_reset0
-                _step_timing = {
-                    'env_pre_step_time': _t_pre,
-                    'env_stepping_time': _t_step,
-                    'env_reward_time': _t_reward,
-                    'env_reset_time': _t_reset,
-                    'env_obs_time': 0.0,
-                }
-                for i, tobs in terminal_obs.items():
-                    infos[i]['terminal_observation'] = tobs
-                for info in infos:
-                    info.update(_step_timing)
-                return obs, rewards, terminateds, truncateds, infos
-
             # Normal auto-reset (same map)
 
             # Phase 0: clean up previous crosswalk-challenge actors for
@@ -1435,32 +1145,22 @@ class CarlaMultiAgentEnv:
                         self._challenge_actor_ids[i])
                     self._challenge_actor_ids[i] = []
 
-            # Phase 1: pre-decide crosswalk challenges (need spawn pos
-            #          before teleporting agents)
-            crosswalk_spawns = {}  # agent_idx -> (agent_pos_ue, goal_std)
-            cfg = self.obstacle_mgr.config
-            if cfg is not None:
-                for i in reset_set:
-                    if random.random() < cfg.p_crosswalk_challenge:
-                        bounds = self.quadrant_inner_bounds[i]
-                        result = self.obstacle_mgr.setup_crosswalk_challenge(
-                            bounds)
-                        if result is not None:
-                            agent_pos, goal_std, actor_ids = result
-                            crosswalk_spawns[i] = (agent_pos, goal_std)
-                            self._challenge_actor_ids[i] = actor_ids
-
+            # Phase 1: load precomputed scenarios (always required)
+            precomp_scenarios = {}  # agent_idx -> scenario dict
+            for i in reset_set:
+                scenario = self._load_next_scenario(i)
+                if scenario is not None:
+                    precomp_scenarios[i] = scenario
+            
             # Phase 2: teleport finished agents
             for i in reset_set:
-                if i in crosswalk_spawns:
-                    pos = crosswalk_spawns[i][0]  # agent_pos_ue (3,)
-                    tf = carla.Transform(carla.Location(
-                        x=float(pos[0]), y=float(pos[1]),
-                        z=float(pos[2]) + 2.0))
-                    self.robots[i].set_transform(tf)
-                else:
-                    self._reset_agent_pose(i)
-
+                assert i in precomp_scenarios, f"No precomputed scenario for agent {i}"
+                pos = precomp_scenarios[i]['start_ue']
+                tf = carla.Transform(carla.Location(
+                    x=float(pos[0]), y=float(pos[1]),
+                    z=float(pos[2]) + 2.0))
+                self.robots[i].set_transform(tf)
+                
             # One tick to settle teleported agents & produce fresh sensor data
             self.world.tick()
 
@@ -1468,12 +1168,10 @@ class CarlaMultiAgentEnv:
                 if i in reset_set:
                     # Fresh observation for the new episode
                     self._initialize_buffer(i)
-                    if i in crosswalk_spawns:
-                        _, goal_std = crosswalk_spawns[i]
-                        self._try_crosswalk_or_fallback(
-                            i, crosswalk_spawns, goal_std)
-                    else:
-                        self._sample_solvable_goal(i)
+                    applied = self._apply_precomputed_scenario(
+                        i, precomp_scenarios[i])
+                    assert applied, f"Failed to apply precomputed scenario for agent {i}"
+                    
                     self.initial_distances[i] = self._distance_to_goal(i)
                     self.initial_geodesic_distances[i] = \
                         self._geodesic_distance_to_goal(i)
@@ -1506,7 +1204,430 @@ class CarlaMultiAgentEnv:
             infos[i]['terminal_observation'] = tobs
         return obs, rewards, terminateds, truncateds, infos
 
+
+    # ── Cleanup ───────────────────────────────────────────────────────
+    def close(self):
+        if self.client is None:
+            return
+
+        print("\n  Cleaning up multi-agent episode...")
+        # Destroy CCTV cameras
+        self.destroy_cctv_cameras()
+        # Destroy procedural obstacles and SFM pedestrians
+        self.obstacle_mgr.clear_all(self.client)
+        self.ped_mgr.clear_all(self.client)
+
+        # Destroy sensors
+        for agent_sensors in self.sensors:
+            for s in agent_sensors:
+                try:
+                    s.stop()
+                    s.destroy()
+                except Exception:
+                    pass
+
+        # Destroy all actors (walkers + any remaining sensors)
+        if self.all_actor_ids:
+            try:
+                self.client.apply_batch(
+                    [carla.command.DestroyActor(x) for x in self.all_actor_ids])
+            except Exception:
+                pass
+        try:
+            settings = self.world.get_settings()
+            settings.fixed_delta_seconds = None
+            settings.synchronous_mode = False
+            self.world.apply_settings(settings)
+        except Exception:
+            pass
+
+        self.client = None
+        return
+
+    # ── Public API ────────────────────────────────────────────────────
+
+    def set_collect_substep_frames(self, enabled: bool):
+        self._collect_substep_frames = enabled
+
+    # ── CCTV cameras (persistent sensors for vis iterations) ─────────
+
+    def spawn_cctv_cameras(self, specs, fov=90.0, img_size=512):
+        """Spawn persistent CCTV cameras for video capture during rollouts.
+
+        Parameters
+        ----------
+        specs : list of dict, one per camera, each with keys
+            ``agent_idx``  – which agent this camera is associated with
+            ``cam_ue``     – (3,) camera position in UE world coords (x, y, z)
+            ``pitch_deg``  – CARLA pitch (negative = look down)
+            ``yaw_deg``    – CARLA yaw in degrees
+            ``ground_z_ue`` – ground elevation in UE z
+        fov      : horizontal FOV in degrees
+        img_size : pixel side length (square)
+        """
+        self.destroy_cctv_cameras()
+        self._cctv_specs = []
+        self._cctv_frames = {}
+
+        for spec in specs:
+            aidx = spec['agent_idx']
+            cam_bp = self.bp_lib.find('sensor.camera.rgb')
+            cam_bp.set_attribute('image_size_x', str(img_size))
+            cam_bp.set_attribute('image_size_y', str(img_size))
+            cam_bp.set_attribute('fov', str(fov))
+
+            cam_tf = carla.Transform(
+                carla.Location(x=float(spec['cam_ue'][0]),
+                               y=float(spec['cam_ue'][1]),
+                               z=float(spec['cam_ue'][2])),
+                carla.Rotation(pitch=float(spec['pitch_deg']),
+                               yaw=float(spec['yaw_deg']),
+                               roll=0.0),
+            )
+
+            q = Queue()
+            cam = self.world.spawn_actor(cam_bp, cam_tf)
+            cam.listen(lambda data, _q=q: _q.put(data))
+            self._cctv_cameras.append(cam)
+            self._cctv_queues.append(q)
+            self._cctv_specs.append({
+                **spec,
+                'fov_deg': fov,
+                'img_size': img_size,
+            })
+            self._cctv_frames.setdefault(aidx, [])
+
+        # Tick once so each camera produces an initial frame, then discard.
+        self.world.tick()
+        for q in self._cctv_queues:
+            try:
+                q.get(timeout=5.0)
+            except Exception:
+                pass
+        for i in range(self.num_agents):
+            self._drain_sensor_queues(i)
+
+    def _collect_cctv_step_frame(self):
+        """Drain CCTV queues and keep the last frame per camera (one per step)."""
+        if not self._cctv_cameras:
+            return
+        for spec, q in zip(self._cctv_specs, self._cctv_queues):
+            latest = None
+            while True:
+                try:
+                    latest = q.get_nowait()
+                except Empty:
+                    break
+            if latest is not None:
+                sz = spec['img_size']
+                img = np.frombuffer(latest.raw_data, dtype=np.uint8)
+                img = img.reshape((sz, sz, 4))[..., :3][..., [2, 1, 0]]
+                self._cctv_frames[spec['agent_idx']].append(img)
+
+    def collect_cctv_frames(self):
+        """Return accumulated CCTV frames and per-camera metadata.
+
+        Returns dict with ``'frames'`` (agent_idx -> (T,H,W,3) uint8 or None)
+        and ``'specs'`` (list of spec dicts).
+        """
+        frames = {}
+        for aidx, flist in self._cctv_frames.items():
+            frames[aidx] = np.stack(flist) if flist else None
+        return {'frames': frames, 'specs': self._cctv_specs}
+
+    def destroy_cctv_cameras(self):
+        """Stop and destroy all CCTV camera actors."""
+        for cam in self._cctv_cameras:
+            try:
+                cam.stop()
+                cam.destroy()
+            except Exception:
+                pass
+        self._cctv_cameras = []
+        self._cctv_queues = []
+        self._cctv_specs = []
+        self._cctv_frames = {}
+
+
+
+    # ── BEV capture ───────────────────────────────────────────────────
+
+    def capture_bev(self, env_idx: int = 0, altitude: float = 50.0,
+                    fov: float = 90.0, img_size: int = 512):
+        """Capture an overhead BEV image centred on agent env_idx."""
+        ego_loc = self.robots[env_idx].get_transform().location
+
+        cam_bp = self.bp_lib.find('sensor.camera.rgb')
+        cam_bp.set_attribute('image_size_x', str(img_size))
+        cam_bp.set_attribute('image_size_y', str(img_size))
+        cam_bp.set_attribute('fov', str(fov))
+
+        cam_tf = carla.Transform(
+            carla.Location(x=ego_loc.x, y=ego_loc.y,
+                           z=ego_loc.z + altitude),
+            carla.Rotation(pitch=-90.0, roll=0.0, yaw=0.0),
+        )
+
+        bev_q = Queue()
+        cam = self.world.spawn_actor(cam_bp, cam_tf)
+        cam.listen(lambda data: bev_q.put(data))
+        self.world.tick()
+
+        data = bev_q.get(timeout=30.0)
+        img = np.frombuffer(data.raw_data, dtype=np.uint8)
+        img = img.reshape((img_size, img_size, 4))[..., :3][..., [2, 1, 0]]
+
+        cam.stop()
+        cam.destroy()
+
+        # Drain the extra tick's sensor data from all agents
+        for i in range(self.num_agents):
+            self._drain_sensor_queues(i)
+
+        cam_pose = self._camera2world(env_idx, 'fcam')
+        center_xz = np.array([cam_pose[0], cam_pose[2]], dtype=np.float32)
+        meta = {
+            'center_xz': center_xz,
+            'altitude': float(altitude),
+            'fov_deg': float(fov),
+            'img_size': int(img_size),
+        }
+        return img, meta
+
+    def capture_bev_batch(self, specs, fov=90.0, img_size=512):
+        """Capture BEV images at multiple positions in a single world tick.
+
+        Parameters
+        ----------
+        specs : list of dict, each with keys
+            ``center_xz`` - (x_std, z_std) standard world coords
+            ``altitude``  - metres above estimated ground
+        fov      : horizontal FOV (degrees)
+        img_size : pixel side length
+
+        Returns
+        -------
+        list of (img, meta) tuples, one per spec.
+        """
+        cams = []
+        queues = []
+
+        for spec in specs:
+            cx, cz = float(spec['center_xz'][0]), float(spec['center_xz'][1])
+            alt = float(spec['altitude'])
+            # Standard -> UE: ue_x = z_std, ue_y = x_std
+            ue_x, ue_y = cz, cx
+
+            cam_bp = self.bp_lib.find('sensor.camera.rgb')
+            cam_bp.set_attribute('image_size_x', str(img_size))
+            cam_bp.set_attribute('image_size_y', str(img_size))
+            cam_bp.set_attribute('fov', str(fov))
+
+            cam_tf = carla.Transform(
+                carla.Location(x=ue_x, y=ue_y, z=alt + 2.0),
+                carla.Rotation(pitch=-90.0, roll=0.0, yaw=0.0),
+            )
+
+            q = Queue()
+            cam = self.world.spawn_actor(cam_bp, cam_tf)
+            cam.listen(lambda data, q=q: q.put(data))
+            cams.append(cam)
+            queues.append(q)
+
+        # Single tick renders all cameras
+        self.world.tick()
+
+        results = []
+        for spec, cam, q in zip(specs, cams, queues):
+            data = q.get(timeout=30.0)
+            img = np.frombuffer(data.raw_data, dtype=np.uint8)
+            img = img.reshape((img_size, img_size, 4))[..., :3][..., [2, 1, 0]]
+
+            meta = {
+                'center_xz': np.array(spec['center_xz'], dtype=np.float32),
+                'altitude': float(spec['altitude']),
+                'fov_deg': float(fov),
+                'img_size': int(img_size),
+            }
+            results.append((img, meta))
+
+            cam.stop()
+            cam.destroy()
+
+        # Drain sensor queues for all agents
+        for i in range(self.num_agents):
+            self._drain_sensor_queues(i)
+
+        return results
+
+    def get_obstacle_layout(self):
+        """Return obstacle, pedestrian, and per-agent metadata for BEV visualisation."""
+        layout = self.obstacle_mgr.get_obstacle_layout()
+        layout.update(self.ped_mgr.get_pedestrian_layout())
+
+        # Mark crosswalks that are blocked by precomputed scenario obstacles
+        all_blocked = [obs for obs in self._blocked_cw_obbs if obs is not None]
+        if all_blocked and layout.get('crosswalks'):
+            from rl.utils.mesh_utils import points_in_convex_polygon
+            for cw_entry in layout['crosswalks']:
+                if not isinstance(cw_entry, dict):
+                    continue
+                cw_center = cw_entry.get('center_std')
+                if cw_center is None:
+                    continue
+                pt = cw_center.reshape(1, 2)
+                for obbs in all_blocked:
+                    for obb in obbs:
+                        if points_in_convex_polygon(pt, obb)[0]:
+                            cw_entry['blocked'] = True
+                            break
+                    if cw_entry.get('blocked'):
+                        break
+
+        # Navmesh area triangles for segmentation-style BEV rendering
+        if (self._navmesh_cache is not None
+                and self._current_town is not None
+                and self._navmesh_cache.has_town(self._current_town)):
+            layout.update(
+                self._navmesh_cache.get_area_triangles_std(self._current_town))
+
+        # Per-agent metadata (ego position, goal, sampling method, scenarios)
+        _QUADRANT_NAMES = ['lower-left', 'lower-right',
+                           'upper-left', 'upper-right']
+        agents = []
+        for i in range(self.num_agents):
+            ego_std = self._get_xz(i).copy()
+            goal_std = (self.goal_globals[i].copy()
+                        if self.goal_globals[i] is not None
+                        else ego_std)
+            # Re-trace geodesic from the *current* position so the path
+            # starts at ego_std rather than the (possibly stale) spawn
+            # position recorded at episode reset.
+            geo_path = self._geo_paths[i]
+            if (self._dynamic_geo_mode == 'timespace'
+                    and self._dgeo_fields[i] is not None
+                    and self._dgeo_V[i] is not None
+                    and self._geo_dists[i] is not None):
+                geo_path = self._dgeo_fields[i].trace_path(
+                    self._dgeo_V[i], ego_std, self._geo_dists[i])
+            elif (self._geo_grids[i] is not None
+                    and self._geo_dists[i] is not None):
+                geo_path = self._geo_grids[i].trace_path(
+                    self._geo_dists[i], ego_std)
+            # Geodesic field data for heatmap visualisation
+            geo = self._geo_grids[i]
+            geo_grid_meta = None
+            geo_field_2d = None
+            geo_field_3d = None
+            if geo is not None:
+                geo_grid_meta = {
+                    'x_min': geo._x_min, 'z_min': geo._z_min,
+                    'resolution': geo._resolution,
+                    'H': geo._H, 'W': geo._W,
+                }
+                if self._geo_dists[i] is not None:
+                    geo_field_2d = self._geo_dists[i]
+                if self._dgeo_V[i] is not None:
+                    geo_field_3d = self._dgeo_V[i]
+
+            agents.append({
+                'ego_std': ego_std,
+                'goal_std': goal_std,
+                'geodesic_path_std': geo_path if geo_path is not None and len(geo_path) > 0 else None,
+                'goal_method': self._goal_methods[i],
+                'initial_distance': float(self.initial_distances[i]),
+                'geodesic_distance': float(self._geodesic_distance_to_goal(i)),
+                'step_count': int(self.step_counts[i]),
+                'region_scenarios': self.obstacle_mgr.get_region_scenarios(i),
+                'town': self._current_town or '?',
+                'quadrant': _QUADRANT_NAMES[i] if i < len(_QUADRANT_NAMES) else f'region {i}',
+                'geo_grid_meta': geo_grid_meta,
+                'geo_field_2d': geo_field_2d,
+                'geo_field_3d': geo_field_3d,
+            })
+        layout['agents'] = agents
+        return layout
+
+    @staticmethod
+    def bev_world_to_pixel(xz_world, meta) -> np.ndarray:
+        """Project standard xz positions to BEV image pixel coords."""
+        xz = np.asarray(xz_world, dtype=np.float64)
+        h = meta['altitude']
+        s = meta['img_size']
+        ctr = meta['center_xz']
+        fov_rad = np.deg2rad(meta['fov_deg'])
+        scale = s / (2.0 * h * np.tan(fov_rad / 2.0))
+        dx = xz[..., 0] - ctr[0]
+        dz = xz[..., 1] - ctr[1]
+        u = s / 2.0 + scale * dx
+        v = s / 2.0 - scale * dz
+        return np.stack([u, v], axis=-1)
+
+
+    # ── Solvability statistics ─────────────────────────────────────────
+
+    def get_solvability_stats(self, reset=False):
+        """Return cumulative solvability statistics and optionally reset.
+
+        Returns a dict with:
+        - ``solvable_episodes``: count of episodes confirmed solvable
+        - ``unsolvable_episodes``: count that remained unsolvable after retries
+        - ``unsolvable_rate``: fraction unsolvable (0 if no episodes)
+        - ``goal_retries_total``: total goal-resampling retries
+        - ``mean_goal_retries``: mean retries per episode (0 if no episodes)
+        """
+        total = self._solvable_episodes + self._unsolvable_episodes
+        obs_req = self._obstacle_spawn_requested
+        obs_fail = self._obstacle_spawn_failed
+        stats = {
+            'solvable_episodes': self._solvable_episodes,
+            'unsolvable_episodes': self._unsolvable_episodes,
+            'unsolvable_rate': (
+                self._unsolvable_episodes / total if total > 0 else 0.0),
+            'goal_retries_total': self._goal_retries_total,
+            'mean_goal_retries': (
+                self._goal_retries_total / total if total > 0 else 0.0),
+            'obstacle_spawn_requested': obs_req,
+            'obstacle_spawn_failed': obs_fail,
+            'obstacle_spawn_fail_rate': (
+                obs_fail / obs_req if obs_req > 0 else 0.0),
+        }
+        if reset:
+            self._solvable_episodes = 0
+            self._unsolvable_episodes = 0
+            self._goal_retries_total = 0
+            self._obstacle_spawn_requested = 0
+            self._obstacle_spawn_failed = 0
+        return stats
+
+
     # ── Sub-step implementations ──────────────────────────────────────
+
+    def _step_physics_all(self, vels):
+        """WalkerControl-based stepping for all agents."""
+        controls = []
+        for i, (vx, vz) in enumerate(vels):
+            controls.append(_to_walker_control(vx, vz, self._get_pose(i)))
+
+        sim_tick_time = 0.0
+        for _t in range(self.n_skips):
+            for i, ctrl in enumerate(controls):
+                self.robots[i].apply_control(ctrl)
+
+            self.ped_mgr.update(self.dt, self._cached_obs_pos_ue)
+            t_tick0 = time.perf_counter()
+            self.world.tick()
+            sim_tick_time += time.perf_counter() - t_tick0
+
+            for i in range(self.num_agents):
+                self._update_buffer(i)
+                if self._collect_substep_frames:
+                    self._substep_frames[i].append(
+                        self.rgb_buffers[i][-1].copy())
+
+        self._last_sim_tick_time = sim_tick_time
+        self._collect_cctv_step_frame()
+        return
 
     def _step_teleport_all(self, vels):
         """Teleport-based stepping for all agents."""
@@ -1544,31 +1665,9 @@ class CarlaMultiAgentEnv:
                         self.rgb_buffers[i][-1].copy())
 
         self._last_sim_tick_time = sim_tick_time
+        self._collect_cctv_step_frame()
 
-    def _step_physics_all(self, vels):
-        """WalkerControl-based stepping for all agents."""
-        controls = []
-        for i, (vx, vz) in enumerate(vels):
-            controls.append(_to_walker_control(vx, vz, self._get_pose(i)))
-
-        sim_tick_time = 0.0
-        for _t in range(self.n_skips):
-            for i, ctrl in enumerate(controls):
-                self.robots[i].apply_control(ctrl)
-
-            self.ped_mgr.update(self.dt, self._cached_obs_pos_ue)
-            t_tick0 = time.perf_counter()
-            self.world.tick()
-            sim_tick_time += time.perf_counter() - t_tick0
-
-            for i in range(self.num_agents):
-                self._update_buffer(i)
-                if self._collect_substep_frames:
-                    self._substep_frames[i].append(
-                        self.rgb_buffers[i][-1].copy())
-
-        self._last_sim_tick_time = sim_tick_time
-
+    
     def _step_mpc_all(self, per_agent_waypoints):
         """MPC-based stepping for all agents.
 
@@ -1659,263 +1758,46 @@ class CarlaMultiAgentEnv:
 
         self._last_mpc_solve_time = mpc_solve_time
         self._last_sim_tick_time = sim_tick_time
+        self._collect_cctv_step_frame()
+        return
 
-    # ── BEV capture ───────────────────────────────────────────────────
+    # ── Coordinate helpers ────────────────────────────────────────────
 
-    def capture_bev(self, env_idx: int = 0, altitude: float = 50.0,
-                    fov: float = 90.0, img_size: int = 512):
-        """Capture an overhead BEV image centred on agent env_idx."""
-        ego_loc = self.robots[env_idx].get_transform().location
-
-        cam_bp = self.bp_lib.find('sensor.camera.rgb')
-        cam_bp.set_attribute('image_size_x', str(img_size))
-        cam_bp.set_attribute('image_size_y', str(img_size))
-        cam_bp.set_attribute('fov', str(fov))
-
-        cam_tf = carla.Transform(
-            carla.Location(x=ego_loc.x, y=ego_loc.y,
-                           z=ego_loc.z + altitude),
-            carla.Rotation(pitch=-90.0, roll=0.0, yaw=0.0),
-        )
-
-        bev_q = Queue()
-        cam = self.world.spawn_actor(cam_bp, cam_tf)
-        cam.listen(lambda data: bev_q.put(data))
-        self.world.tick()
-
-        data = bev_q.get(timeout=30.0)
-        img = np.frombuffer(data.raw_data, dtype=np.uint8)
-        img = img.reshape((img_size, img_size, 4))[..., :3][..., [2, 1, 0]]
-
-        cam.stop()
-        cam.destroy()
-
-        # Drain the extra tick's sensor data from all agents
-        for i in range(self.num_agents):
-            self._drain_sensor_queues(i)
-
-        cam_pose = self._camera2world(env_idx, 'fcam')
-        center_xz = np.array([cam_pose[0], cam_pose[2]], dtype=np.float32)
-        meta = {
-            'center_xz': center_xz,
-            'altitude': float(altitude),
-            'fov_deg': float(fov),
-            'img_size': int(img_size),
-        }
-        return img, meta
-
-    def capture_bev_batch(self, specs, fov=90.0, img_size=512):
-        """Capture BEV images at multiple positions in a single world tick.
-
-        Parameters
-        ----------
-        specs : list of dict, each with keys
-            ``center_xz`` – (x_std, z_std) standard world coords
-            ``altitude``  – metres above estimated ground
-        fov      : horizontal FOV (degrees)
-        img_size : pixel side length
-
-        Returns
-        -------
-        list of (img, meta) tuples, one per spec.
+    def _camera2world(self, agent_idx, sensor_id='fcam'):
         """
-        cams = []
-        queues = []
-
-        for spec in specs:
-            cx, cz = float(spec['center_xz'][0]), float(spec['center_xz'][1])
-            alt = float(spec['altitude'])
-            # Standard -> UE: ue_x = z_std, ue_y = x_std
-            ue_x, ue_y = cz, cx
-
-            cam_bp = self.bp_lib.find('sensor.camera.rgb')
-            cam_bp.set_attribute('image_size_x', str(img_size))
-            cam_bp.set_attribute('image_size_y', str(img_size))
-            cam_bp.set_attribute('fov', str(fov))
-
-            cam_tf = carla.Transform(
-                carla.Location(x=ue_x, y=ue_y, z=alt + 2.0),
-                carla.Rotation(pitch=-90.0, roll=0.0, yaw=0.0),
-            )
-
-            q = Queue()
-            cam = self.world.spawn_actor(cam_bp, cam_tf)
-            cam.listen(lambda data, q=q: q.put(data))
-            cams.append(cam)
-            queues.append(q)
-
-        # Single tick renders all cameras
-        self.world.tick()
-
-        results = []
-        for spec, cam, q in zip(specs, cams, queues):
-            data = q.get(timeout=30.0)
-            img = np.frombuffer(data.raw_data, dtype=np.uint8)
-            img = img.reshape((img_size, img_size, 4))[..., :3][..., [2, 1, 0]]
-
-            meta = {
-                'center_xz': np.array(spec['center_xz'], dtype=np.float32),
-                'altitude': float(spec['altitude']),
-                'fov_deg': float(fov),
-                'img_size': int(img_size),
-            }
-            results.append((img, meta))
-
-            cam.stop()
-            cam.destroy()
-
-        # Drain sensor queues for all agents
-        for i in range(self.num_agents):
-            self._drain_sensor_queues(i)
-
-        return results
-
-    def get_obstacle_layout(self):
-        """Return obstacle, pedestrian, and per-agent metadata for BEV visualisation."""
-        layout = self.obstacle_mgr.get_obstacle_layout()
-        layout.update(self.ped_mgr.get_pedestrian_layout())
-
-        # Navmesh area triangles for segmentation-style BEV rendering
-        if (self._navmesh_cache is not None
-                and self._current_town is not None
-                and self._navmesh_cache.has_town(self._current_town)):
-            layout.update(
-                self._navmesh_cache.get_area_triangles_std(self._current_town))
-
-        # Per-agent metadata (ego position, goal, sampling method, scenarios)
-        _QUADRANT_NAMES = ['lower-left', 'lower-right',
-                           'upper-left', 'upper-right']
-        agents = []
-        for i in range(self.num_agents):
-            ego_std = self._get_xz(i).copy()
-            goal_std = (self.goal_globals[i].copy()
-                        if self.goal_globals[i] is not None
-                        else ego_std)
-            # Re-trace geodesic from the *current* position so the path
-            # starts at ego_std rather than the (possibly stale) spawn
-            # position recorded at episode reset.
-            geo_path = self._geo_paths[i]
-            if (self._dynamic_geo_mode == 'timespace'
-                    and self._dgeo_fields[i] is not None
-                    and self._dgeo_V[i] is not None
-                    and self._geo_dists[i] is not None):
-                geo_path = self._dgeo_fields[i].trace_path(
-                    self._dgeo_V[i], ego_std, self._geo_dists[i])
-            elif (self._geo_grids[i] is not None
-                    and self._geo_dists[i] is not None):
-                geo_path = self._geo_grids[i].trace_path(
-                    self._geo_dists[i], ego_std)
-            # Geodesic field data for heatmap visualisation
-            geo = self._geo_grids[i]
-            geo_grid_meta = None
-            geo_field_2d = None
-            geo_field_3d = None
-            if geo is not None:
-                geo_grid_meta = {
-                    'x_min': geo._x_min, 'z_min': geo._z_min,
-                    'resolution': geo._resolution,
-                    'H': geo._H, 'W': geo._W,
-                }
-                if self._geo_dists[i] is not None:
-                    geo_field_2d = self._geo_dists[i]
-                if self._dgeo_V[i] is not None:
-                    geo_field_3d = self._dgeo_V[i]
-
-            agents.append({
-                'ego_std': ego_std,
-                'goal_std': goal_std,
-                'geodesic_path_std': geo_path if geo_path is not None and len(geo_path) > 0 else None,
-                'goal_method': self._goal_methods[i],
-                'initial_distance': float(self.initial_distances[i]),
-                'geodesic_distance': float(self._geodesic_distance_to_goal(i)),
-                'step_count': int(self.step_counts[i]),
-                'region_scenarios': self.obstacle_mgr.get_region_scenarios(i),
-                'town': self._current_town or '?',
-                'quadrant': _QUADRANT_NAMES[i] if i < len(_QUADRANT_NAMES) else f'region {i}',
-                'geo_grid_meta': geo_grid_meta,
-                'geo_field_2d': geo_field_2d,
-                'geo_field_3d': geo_field_3d,
-            })
-        layout['agents'] = agents
-        return layout
-
-    @staticmethod
-    def bev_world_to_pixel(xz_world, meta) -> np.ndarray:
-        """Project standard xz positions to BEV image pixel coords."""
-        xz = np.asarray(xz_world, dtype=np.float64)
-        h = meta['altitude']
-        s = meta['img_size']
-        ctr = meta['center_xz']
-        fov_rad = np.deg2rad(meta['fov_deg'])
-        scale = s / (2.0 * h * np.tan(fov_rad / 2.0))
-        dx = xz[..., 0] - ctr[0]
-        dz = xz[..., 1] - ctr[1]
-        u = s / 2.0 + scale * dx
-        v = s / 2.0 - scale * dz
-        return np.stack([u, v], axis=-1)
-
-    # ── Solvability statistics ─────────────────────────────────────────
-
-    def get_solvability_stats(self, reset=False):
-        """Return cumulative solvability statistics and optionally reset.
-
-        Returns a dict with:
-        - ``solvable_episodes``: count of episodes confirmed solvable
-        - ``unsolvable_episodes``: count that remained unsolvable after retries
-        - ``unsolvable_rate``: fraction unsolvable (0 if no episodes)
-        - ``goal_retries_total``: total goal-resampling retries
-        - ``mean_goal_retries``: mean retries per episode (0 if no episodes)
+        7-dim camera-to-world pose in standard coordinates
+            standard - x: right / z: front / y: down
+            UE       - x: front / y: right / z: up
         """
-        total = self._solvable_episodes + self._unsolvable_episodes
-        stats = {
-            'solvable_episodes': self._solvable_episodes,
-            'unsolvable_episodes': self._unsolvable_episodes,
-            'unsolvable_rate': (
-                self._unsolvable_episodes / total if total > 0 else 0.0),
-            'goal_retries_total': self._goal_retries_total,
-            'mean_goal_retries': (
-                self._goal_retries_total / total if total > 0 else 0.0),
-        }
-        if reset:
-            self._solvable_episodes = 0
-            self._unsolvable_episodes = 0
-            self._goal_retries_total = 0
-        return stats
+        r2w = np.array(self.robots[agent_idx].get_transform().get_matrix())     # robot-to-world (in UE coordinate system)
+        c2w = r2w @ self.c2r[agent_idx][sensor_id]                              # camera-to-world
+        c2w = UE @ c2w @ UE.T                                                   # to standard coorinate system (right-handed)
+        # 3d position of the camera in the (standard) world frame
 
-    # ── Cleanup ───────────────────────────────────────────────────────
+        xyz = c2w[:3, -1]               
+        q = R.from_matrix(c2w[:3, :3]).as_quat()        # [qx, qy, qz, qw]
+        return np.concatenate((xyz, q))
 
-    def close(self):
-        if self.client is None:
-            return
+    def _get_pose(self, agent_idx):
+        # standard camera-to-world
+        return np.copy(self.pose_buffers[agent_idx][-1])
 
-        print("\n  Cleaning up multi-agent episode...")
-        # Destroy procedural obstacles and SFM pedestrians
-        self.obstacle_mgr.clear_all(self.client)
-        self.ped_mgr.clear_all(self.client)
+    def _get_xz(self, agent_idx):
+        """camera position on the standard xz-plane: [x_std, z_std]"""
+        p = self._get_pose(agent_idx)
+        return np.array([p[0], p[2]])
 
-        # Destroy sensors
-        for agent_sensors in self.sensors:
-            for s in agent_sensors:
-                try:
-                    s.stop()
-                    s.destroy()
-                except Exception:
-                    pass
+    def _goal_cam(self, agent_idx):
+        """goal in the camera frame: [x_cam, z_cam]"""
+        goal_world = self.goal_globals[agent_idx] - self._get_xz(agent_idx)     # goal pos w.r.t. ego (but orientation w.r.t. world)
+        c2w_R = R.from_quat(self._get_pose(agent_idx)[3:])
+        g = c2w_R.inv().apply(np.array([goal_world[0], 0., goal_world[1]]))
+        return np.array([g[0], g[2]])
 
-        # Destroy all actors (walkers + any remaining sensors)
-        if self.all_actor_ids:
-            try:
-                self.client.apply_batch(
-                    [carla.command.DestroyActor(x) for x in self.all_actor_ids])
-            except Exception:
-                pass
+    def _distance_to_goal(self, agent_idx):
+        g = self._goal_cam(agent_idx)
+        return float(np.sqrt(g @ g))
 
-        try:
-            settings = self.world.get_settings()
-            settings.fixed_delta_seconds = None
-            settings.synchronous_mode = False
-            self.world.apply_settings(settings)
-        except Exception:
-            pass
-
-        self.client = None
+    def _potential(self, agent_idx):
+        return -self._distance_to_goal(agent_idx)
+    

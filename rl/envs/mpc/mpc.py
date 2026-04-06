@@ -162,7 +162,7 @@ class MPC:
         # t_wall = sum(t for key, t in stats.items() if key.startswith('t_wall'))
 
 
-        stats = {'t_wall': t_wall}
+        stats = {'t_wall': t_wall, 'optimal_cost': float(sol['f'])}
 
 
         return x_sol, u_sol, stats

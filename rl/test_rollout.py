@@ -2,8 +2,8 @@
 Test rollout script for rapid scenario/visualization debugging.
 
 Runs a single rollout (no training) with random or zero actions, then
-produces the same BEV / ego-video / obstacle-layout visualizations as
-the PPO trainer.
+produces the same BEV / ego-video / obstacle-layout / CCTV / geodesic-field
+visualizations as the PPO trainer.
 
 Usage:
     # Random actions (default):
@@ -32,24 +32,12 @@ from config.utils import load_config
 
 from rl.utils.carla_manager import VecCarlaMultiAgentEnv, launch_carla_servers, stop_carla_servers
 from rl.utils.vis import (visualize, compute_bev_specs,
-                          compute_episode_bev_specs, log_complete_episode_bev,
-                          log_obstacle_bev_figure)
+                          log_obstacle_bev_figure,
+                          log_geodesic_field,
+                          compute_cctv_specs, log_cctv_video_grid,
+                          WeatherTracker, log_weather_distributions,
+                          GeodesicTracker, log_geodesic_distributions)
 from rl.utils.buffer import RolloutBuffers
-
-
-# ─── Minimal episode accumulator (mirrors EpisodeTrajectoryAccumulator) ──
-class SimpleEpisodeAccumulator:
-    """Track spawn positions for complete-episode BEV."""
-
-    def __init__(self, num_envs):
-        self.continuation_spawns = [None] * num_envs
-
-    def set_initial_spawns(self, cord_all):
-        for i in range(len(cord_all)):
-            self.continuation_spawns[i] = cord_all[i].copy()
-
-    def on_episode_end(self, env_idx, new_cord):
-        self.continuation_spawns[env_idx] = new_cord.copy()
 
 
 # ─── Rollout ─────────────────────────────────────────────────────────
@@ -113,6 +101,10 @@ def run_test(args):
         navmesh_cache_dir=args.navmesh_cache_dir,
         quadrant_margin=args.quadrant_margin,
         randomize_weather=args.weather,
+        use_mpc=args.use_mpc,
+        dynamic_geo_mode=args.dynamic_geo_mode,
+        dynamic_geo_horizon=args.dynamic_geo_horizon,
+        scenario_dir=args.scenario_dir,
     )
 
     num_envs = vec_env.num_envs
@@ -133,12 +125,12 @@ def run_test(args):
         num_tokens, obs_feat_dim, device="cpu",
     )
 
-    ep_accum = SimpleEpisodeAccumulator(num_envs)
+    weather_tracker = WeatherTracker(num_envs)
+    geodesic_tracker = GeodesicTracker(num_envs)
 
     # ── reset ──
     print(f"Resetting {num_envs} envs (action_mode={args.action_mode}) ...")
     obs_dict, _ = vec_env.reset()
-    ep_accum.set_initial_spawns(obs_dict['cord'])
 
     # ── obstacle layouts (needed before BEV capture for auto-altitude) ──
     obstacle_layouts = None
@@ -165,6 +157,21 @@ def run_test(args):
             bev_images[i], bev_metas[i] = result
 
     substep_frames = [[] for _ in range(num_envs)]
+    mpc_vis_data = [[] for _ in range(num_envs)]
+    ped_positions = [[] for _ in range(num_envs)]
+
+    # ── CCTV cameras (spawned before rollout, captured during) ──
+    try:
+        _cctv_specs = compute_cctv_specs(
+            obs_dict['cord'],
+            obs_dict.get('goal_world', obs_dict['goal']),
+            obstacle_layouts=obstacle_layouts,
+        )
+        if _cctv_specs:
+            vec_env.spawn_cctv_cameras(_cctv_specs, fov=90.0, img_size=512)
+            print(f"  Spawned {len(_cctv_specs)} CCTV camera(s)")
+    except Exception as e:
+        print(f"  [CCTV] camera spawn failed: {e}")
 
     # ── rollout ──
     print(f"Running {num_steps}-step rollout ...")
@@ -190,22 +197,34 @@ def run_test(args):
         obs_dict, rewards, terminateds, truncateds, infos = vec_env.step(env_actions)
         dones = np.logical_or(terminateds, truncateds).astype(np.float32)
 
-        # collect substep frames
+        weather_tracker.update(infos)
+        geodesic_tracker.update(infos)
+
+        # collect vis data
         for i in range(num_envs):
             sf = infos[i].get('substep_frames')
             if sf is not None:
                 substep_frames[i].append(sf)
+            entry = {}
+            wp = infos[i].get('policy_waypoints_cam')
+            if wp is not None:
+                entry['policy_waypoints_cam'] = wp
+            x_sol = infos[i].get('mpc_x_sol')
+            u_sol = infos[i].get('mpc_u_sol')
+            if x_sol is not None:
+                entry['mpc_x_sol'] = x_sol
+                entry['mpc_u_sol'] = u_sol
+            if entry:
+                mpc_vis_data[i].append(entry)
+            pp = infos[i].get('pedestrian_positions_std')
+            ped_positions[i].append(
+                pp if pp is not None else np.empty((0, 2)))
 
         bufs.store_control_info(step, infos)
         bufs.raw_rewards[step] = np.copy(rewards)
         bufs.rewards[step] = rewards
         bufs.dones[step] = dones
         bufs.terminateds[step] = terminateds.astype(np.float32)
-
-        # reset tracking for finished episodes
-        for i in range(num_envs):
-            if dones[i]:
-                ep_accum.on_episode_end(i, obs_dict['cord'][i])
 
         if (step + 1) % 20 == 0:
             print(f"  step {step + 1}/{num_steps}")
@@ -224,44 +243,43 @@ def run_test(args):
     print("Generating visualizations ...")
     visualize(iteration, args, bufs, bev_images, bev_metas, wandb_module=None,
               substep_frames=substep_frames, obs_encoder=None,
-              obstacle_layouts=obstacle_layouts)
+              obstacle_layouts=obstacle_layouts,
+              mpc_vis_data=mpc_vis_data)
 
-    # complete-episode BEV
+    '''
+    # ── CCTV video (fixed cameras with trajectory overlay) ──
     try:
-        ep_specs, ep_key_map = compute_episode_bev_specs(
-            bufs.cord, bufs.goal_world, bufs.dones,
-            ep_accum.continuation_spawns,
-            default_altitude=args.bev_altitude,
-            fov=args.bev_fov,
-        )
-        ep_bev_results = vec_env.capture_bev_at_positions(
-            ep_specs,
-            fov=args.bev_fov,
-            img_size=args.bev_img_size,
-        )
-        log_complete_episode_bev(
-            bufs.cord, bufs.goal_world, bufs.raw_rewards,
-            bufs.dones, ep_accum.continuation_spawns,
-            ep_bev_results, ep_key_map,
-            grid_cols=args.num_agents_per_server,
-            iteration=iteration,
-            save_dir=vis_dir,
-            wandb=None,
-        )
+        cctv_data = vec_env.collect_cctv_frames()
+        if cctv_data.get('frames'):
+            log_cctv_video_grid(
+                cctv_data,
+                bufs.cord, bufs.actions,
+                buf_rewards=bufs.raw_rewards,
+                buf_dones=bufs.dones,
+                buf_terminateds=bufs.terminateds,
+                ped_positions=ped_positions,
+                obstacle_layouts=obstacle_layouts,
+                fps=args.vis_video_fps,
+                iteration=iteration,
+                save_dir=vis_dir,
+                wandb=None,
+                grid_cols=args.num_agents_per_server,
+            )
     except Exception as e:
-        print(f"  [BEV-ep] complete-episode vis failed: {e}")
+        print(f"  [CCTV] video generation failed: {e}")
+    try:
+        vec_env.destroy_cctv_cameras()
+    except Exception:
+        pass
+    '''
 
-    # obstacle layout BEV — re-query layouts so pedestrian trajectories
-    # reflect the full rollout (the initial query was pre-rollout)
+    # ── obstacle layout BEV ──
     if obstacle_layouts is not None:
-        try:
-            obstacle_layouts = vec_env.get_obstacle_layouts()
-        except Exception as e:
-            print(f"  [BEV-obstacle] post-rollout layout query failed: {e}")
         try:
             log_obstacle_bev_figure(
                 obstacle_layouts,
                 bev_metas,
+                ped_positions=ped_positions,
                 grid_cols=args.num_agents_per_server,
                 iteration=iteration,
                 save_dir=vis_dir,
@@ -269,6 +287,45 @@ def run_test(args):
             )
         except Exception as e:
             print(f"  [BEV-obstacle] obstacle layout vis failed: {e}")
+
+    # ── geodesic distance field heatmap / video ──
+    if obstacle_layouts is not None and args.dynamic_geo_mode != 'off':
+        try:
+            log_geodesic_field(
+                obstacle_layouts,
+                bev_metas,
+                grid_cols=args.num_agents_per_server,
+                iteration=iteration,
+                save_dir=vis_dir,
+                wandb=None,
+                video_fps=args.vis_video_fps,
+            )
+        except Exception as e:
+            print(f"  [BEV-geodesic] geodesic field vis failed: {e}")
+
+    # ── weather parameter distributions ──
+    if weather_tracker.num_samples > 0:
+        try:
+            log_weather_distributions(
+                weather_tracker,
+                iteration=iteration,
+                save_dir=vis_dir,
+                wandb=None,
+            )
+        except Exception as e:
+            print(f"  [weather] distribution vis failed: {e}")
+
+    # ── geodesic distance distributions ──
+    if geodesic_tracker.num_samples > 0:
+        try:
+            log_geodesic_distributions(
+                geodesic_tracker,
+                iteration=iteration,
+                save_dir=vis_dir,
+                wandb=None,
+            )
+        except Exception as e:
+            print(f"  [geodesic] distribution vis failed: {e}")
 
     print(f"Visualizations saved to {vis_dir}/")
 
@@ -313,6 +370,13 @@ if __name__ == "__main__":
     parser.add_argument("--teleport", action="store_true", default=False)
     parser.add_argument("--goal_range", type=float, default=40.0)
     parser.add_argument("--quadrant_margin", type=float, default=None)
+    parser.add_argument("--use_mpc", action="store_true", default=False,
+                        help="Use MPC to convert waypoints to WalkerControl")
+    parser.add_argument("--dynamic_geo_mode", type=str, default="off",
+                        choices=["off", "soft", "timespace"],
+                        help="Dynamic geodesic reward mode")
+    parser.add_argument("--dynamic_geo_horizon", type=float, default=5.0,
+                        help="Prediction horizon for dynamic geodesic (seconds)")
     # procedural obstacles
     parser.add_argument("--obstacles", action="store_true", default=False)
     parser.add_argument("--p_crosswalk_challenge", type=float, default=0.3)
@@ -322,6 +386,10 @@ if __name__ == "__main__":
                         help="Randomize weather and sun position each episode")
     # navmesh cache
     parser.add_argument("--navmesh_cache_dir", type=str, default=None)
+    parser.add_argument("--scenario_dir", type=str, default=None,
+                        help="Directory containing precomputed scenario files "
+                             "(from generate_scenarios.py). Eliminates runtime "
+                             "Dijkstra by loading baked distance fields.")
     # multi-agent
     parser.add_argument("--num_agents_per_server", type=int, default=4)
     parser.add_argument("--towns", type=str, nargs="+",
