@@ -5,7 +5,9 @@ from pytorch_lightning.strategies import DDPStrategy
 
 from pl_modules.citywalk_datamodule import CityWalkDataModule
 from pl_modules.carla_datamodule import CarlaDataModule
+from pl_modules.carla_feat_datamodule import CarlaFeatDataModule
 from pl_modules.distillation_module import DistillationModule
+from pl_modules.distillation_feat_module import DistillationFeatModule
 
 import hydra
 from omegaconf import OmegaConf
@@ -23,11 +25,15 @@ def main(cfg):
     # Initialize the DataModule
     if cfg.data.type == 'carla':
         datamodule = CarlaDataModule(cfg)
+        model = DistillationModule(cfg, teacher_ckpt)
     elif cfg.data.type == 'citywalk':
         datamodule = CityWalkDataModule(cfg)
+        model = DistillationModule(cfg, teacher_ckpt)
+    elif cfg.data.type == 'carla_feat':
+        datamodule = CarlaFeatDataModule(cfg)
+        model = DistillationFeatModule(cfg, teacher_ckpt)
     else:
-        raise ValueError(f"Invalid dataset: {cfg.data.dataset}")
-    model = DistillationModule(cfg, teacher_ckpt)
+        raise ValueError(f"Invalid dataset: {cfg.data.type}")
 
 
     # Initialize logger
