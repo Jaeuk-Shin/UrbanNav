@@ -570,6 +570,10 @@ def _multi_env_worker(pipe, cfg_dict, port, num_agents, max_speed, fps,
             env.set_collect_substep_frames(data)
             pipe.send(True)
 
+        elif cmd == "set_collect_aux_targets":
+            env.set_collect_aux_targets(data)
+            pipe.send(True)
+
         elif cmd == "capture_bev":
             agent_idx, altitude, fov, img_size = data
             try:
@@ -921,6 +925,18 @@ class VecCarlaMultiAgentEnv:
         for i in range(self.num_servers):
             try:
                 self.pipes[i].send(("set_collect_substep_frames", enabled))
+            except (BrokenPipeError, OSError):
+                pass
+        for i in range(self.num_servers):
+            try:
+                self.pipes[i].recv()
+            except (EOFError, BrokenPipeError, OSError):
+                pass
+
+    def set_collect_aux_targets(self, enabled: bool):
+        for i in range(self.num_servers):
+            try:
+                self.pipes[i].send(("set_collect_aux_targets", enabled))
             except (BrokenPipeError, OSError):
                 pass
         for i in range(self.num_servers):

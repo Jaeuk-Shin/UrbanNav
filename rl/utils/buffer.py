@@ -48,12 +48,14 @@ class RolloutBuffers:
 
     def __init__(self, num_steps, num_envs, obs_shape, cord_shape, action_dim,
                  num_tokens, obs_feat_dim, device,
-                 action_history_dim=0):
+                 action_history_dim=0,
+                 aux_heads=None, aux_grid_size=16, aux_max_objects=8):
         self.num_steps = num_steps
         self.num_envs = num_envs
         self.num_tokens = num_tokens
         self.obs_feat_dim = obs_feat_dim
         self.action_history_dim = action_history_dim
+        self.aux_heads = aux_heads or []
 
         # numpy buffers
         self.obs = np.zeros((num_steps, num_envs, *obs_shape), dtype=np.uint8)
@@ -93,6 +95,20 @@ class RolloutBuffers:
             device=device,
         )
 
+        # Auxiliary target buffers (for LSTM probing heads)
+        if "occupancy" in self.aux_heads:
+            self.aux_occupancy = np.zeros(
+                (num_steps, num_envs, aux_grid_size, aux_grid_size),
+                dtype=np.float32)
+        if "obstacle_pos" in self.aux_heads:
+            self.aux_obstacle_pos = np.zeros(
+                (num_steps, num_envs, aux_max_objects, 2), dtype=np.float32)
+            self.aux_obstacle_mask = np.zeros(
+                (num_steps, num_envs, aux_max_objects), dtype=np.float32)
+        if "geodesic_dist" in self.aux_heads:
+            self.aux_geodesic_dist = np.zeros(
+                (num_steps, num_envs), dtype=np.float32)
+
     def store_control_info(self, step, infos):
         """Extract cmd_vel_xz, real_vel_xz, etc. from env info dicts."""
         for i, info in enumerate(infos):
@@ -100,6 +116,23 @@ class RolloutBuffers:
             self.real_vel[step, i] = info.get('real_vel_xz', np.zeros(2))
             self.cmd_speed[step, i] = info.get('cmd_speed', 0.0)
             self.real_speed[step, i] = info.get('real_speed', 0.0)
+
+    def store_aux_targets(self, step, infos):
+        """Extract auxiliary prediction targets from env info dicts."""
+        for i, info in enumerate(infos):
+            if "occupancy" in self.aux_heads:
+                occ = info.get('aux_occupancy')
+                if occ is not None:
+                    self.aux_occupancy[step, i] = occ
+            if "obstacle_pos" in self.aux_heads:
+                pos = info.get('aux_obstacle_pos')
+                msk = info.get('aux_obstacle_mask')
+                if pos is not None:
+                    self.aux_obstacle_pos[step, i] = pos
+                    self.aux_obstacle_mask[step, i] = msk
+            if "geodesic_dist" in self.aux_heads:
+                gd = info.get('geodesic_distance_to_goal', 0.0)
+                self.aux_geodesic_dist[step, i] = gd
 
     def flatten(self, advantages, returns, action_dim,
                 context_size=None, obs_feat_dim=None,
@@ -125,6 +158,18 @@ class RolloutBuffers:
         }
         if self.action_history_dim > 0:
             result["action_hist"] = self.action_hist.reshape(batch_size, self.action_history_dim)
+
+        # Auxiliary targets
+        if "occupancy" in self.aux_heads:
+            G = self.aux_occupancy.shape[-1]
+            result["aux_occupancy"] = self.aux_occupancy.reshape(batch_size, G, G)
+        if "obstacle_pos" in self.aux_heads:
+            K = self.aux_obstacle_pos.shape[-2]
+            result["aux_obstacle_pos"] = self.aux_obstacle_pos.reshape(batch_size, K, 2)
+            result["aux_obstacle_mask"] = self.aux_obstacle_mask.reshape(batch_size, K)
+        if "geodesic_dist" in self.aux_heads:
+            result["aux_geodesic_dist"] = self.aux_geodesic_dist.reshape(batch_size)
+
         return result
 
 

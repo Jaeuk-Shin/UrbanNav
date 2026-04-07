@@ -8,6 +8,7 @@ from torch.distributions import Normal
 
 from rl.models.encoder import ObservationEncoder, SimpleObservationEncoder
 from rl.models.decoder import DistilledActionDecoder
+from rl.models.auxiliary_heads import AuxiliaryHeadGroup
 from model.model_utils import PolarEmbedding
 
 
@@ -19,7 +20,9 @@ class PPOAgent(nn.Module):
 
     def __init__(self, cfg, lstm_hidden_dim=256, lstm_num_layers=1, use_decoder=False,
                  n_action_history=0, goal_mode=None,
-                 norm_obs=False, encoder_type="full"):
+                 norm_obs=False, encoder_type="full",
+                 aux_heads=None, aux_detach=False,
+                 aux_grid_size=16, aux_max_objects=8):
         super().__init__()
 
         self.use_decoder = use_decoder
@@ -97,6 +100,16 @@ class PPOAgent(nn.Module):
         self.mu_head = nn.Linear(head_input_dim, action_dim)
         self.log_std = nn.Parameter(torch.zeros(action_dim))
         self.value_head = nn.Linear(head_input_dim, 1)
+
+        # ── auxiliary probing heads (optional) ──
+        self.aux_head_group = None
+        if aux_heads:
+            self.aux_head_group = AuxiliaryHeadGroup(
+                lstm_hidden_dim, aux_heads,
+                detach=aux_detach,
+                grid_size=aux_grid_size,
+                max_objects=aux_max_objects,
+            )
 
         self._init_weights()
 
@@ -246,7 +259,8 @@ class PPOAgent(nn.Module):
     def get_action_and_value_sequential(self, goal, initial_lstm_state, dones,
                                          num_steps, actions,
                                          features=None, dec_out=None,
-                                         action_history=None):
+                                         action_history=None,
+                                         return_hidden=False):
         """
         Re-evaluate actions with sequential LSTM replay for PPO update.
         Preserves temporal ordering so gradients propagate through time (BPTT),
@@ -265,6 +279,8 @@ class PPOAgent(nn.Module):
         features         : (T*E', N+1, feat_dim) — precomputed encoder features
         dec_out          : (T*E', feat_dim) — precomputed decoder transformer output
         action_history   : (T*E', action_history_dim) or None
+        return_hidden    : bool — if True, also return LSTM hidden states (T*E', H)
+                           for auxiliary head predictions
         """
         envsperbatch = initial_lstm_state[0].shape[1]
 
@@ -332,6 +348,8 @@ class PPOAgent(nn.Module):
         log_prob = dist.log_prob(actions).sum(dim=-1)
         entropy = dist.entropy().sum(dim=-1)
         value = self.value_head(head_input).squeeze(-1)
+        if return_hidden:
+            return actions, log_prob, entropy, value, lstm_state, last_h
         return actions, log_prob, entropy, value, lstm_state
 
     def get_value(self, obs, cord, goal, lstm_state, action_history=None):

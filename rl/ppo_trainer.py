@@ -81,7 +81,8 @@ class RunningMeanStd:
 
 # ─── PPO Update ──────────────────────────────────────────────────────
 def ppo_update(agent, optimizer, batch, args, num_steps, num_envs,
-               initial_lstm_state, device, use_goal_only=False):
+               initial_lstm_state, device, use_goal_only=False,
+               aux_heads_list=None):
     """
     Run PPO with env-based minibatching and sequential LSTM replay.
 
@@ -92,12 +93,16 @@ def ppo_update(agent, optimizer, batch, args, num_steps, num_envs,
     each rollout.
     """
 
-    # freeze encoder & decoder; only train LSTM & goal MLP 
+    # freeze encoder & decoder; only train LSTM & goal MLP
     agent.train()
     if hasattr(agent, 'obs_encoder'):
         agent.obs_encoder.eval()
     if args.use_decoder and hasattr(agent, 'action_decoder'):
         agent.action_decoder.eval()
+
+    has_aux = (aux_heads_list
+               and not use_goal_only
+               and agent.aux_head_group is not None)
 
     batch_size = num_steps * num_envs
     envsperbatch = num_envs // args.num_minibatches
@@ -106,6 +111,7 @@ def ppo_update(agent, optimizer, batch, args, num_steps, num_envs,
     envinds = np.arange(num_envs)
 
     pg_losses, v_losses, ent_losses, clip_fracs, approx_kls = [], [], [], [], []
+    aux_loss_accum = {h: [] for h in (aux_heads_list or [])}
     stopped_epoch = args.num_epochs
 
     for epoch in range(args.num_epochs):
@@ -134,6 +140,7 @@ def ppo_update(agent, optimizer, batch, args, num_steps, num_envs,
                     batch["action_hist"][mb_inds], dtype=torch.float32, device=device
                 )
 
+            lstm_hidden = None
             if use_goal_only:
                 # Feedforward agent — no LSTM replay needed
                 _, new_lp, entropy, new_val, _ = agent.get_action_and_value(
@@ -145,12 +152,23 @@ def ppo_update(agent, optimizer, batch, args, num_steps, num_envs,
                 mb_initial_h = initial_lstm_state[0][:, mbenvinds].contiguous()
                 mb_initial_c = initial_lstm_state[1][:, mbenvinds].contiguous()
 
-                _, new_lp, entropy, new_val, _ = agent.get_action_and_value_sequential(
-                    mb_goal, (mb_initial_h, mb_initial_c), mb_dones,
-                    num_steps, actions=mb_actions,
-                    features=mb_features, dec_out=mb_dec_out,
-                    action_history=mb_action_hist,
-                )
+                if has_aux:
+                    _, new_lp, entropy, new_val, _, lstm_hidden = (
+                        agent.get_action_and_value_sequential(
+                            mb_goal, (mb_initial_h, mb_initial_c), mb_dones,
+                            num_steps, actions=mb_actions,
+                            features=mb_features, dec_out=mb_dec_out,
+                            action_history=mb_action_hist,
+                            return_hidden=True,
+                        ))
+                else:
+                    _, new_lp, entropy, new_val, _ = (
+                        agent.get_action_and_value_sequential(
+                            mb_goal, (mb_initial_h, mb_initial_c), mb_dones,
+                            num_steps, actions=mb_actions,
+                            features=mb_features, dec_out=mb_dec_out,
+                            action_history=mb_action_hist,
+                        ))
 
             # policy loss (clipped)
             ratio = (new_lp - mb_old_lp).exp()
@@ -175,6 +193,32 @@ def ppo_update(agent, optimizer, batch, args, num_steps, num_envs,
 
             loss = pg_loss + args.vf_coef * v_loss + args.ent_coef * ent_loss
 
+            # auxiliary head losses
+            if has_aux and lstm_hidden is not None:
+                aux_preds = agent.aux_head_group(lstm_hidden)
+                aux_targets = {}
+                if "occupancy" in aux_preds and "aux_occupancy" in batch:
+                    aux_targets["occupancy"] = torch.as_tensor(
+                        batch["aux_occupancy"][mb_inds],
+                        dtype=torch.float32, device=device)
+                if "obstacle_pos" in aux_preds and "aux_obstacle_pos" in batch:
+                    aux_targets["obstacle_pos"] = torch.as_tensor(
+                        batch["aux_obstacle_pos"][mb_inds],
+                        dtype=torch.float32, device=device)
+                    aux_targets["obstacle_mask"] = torch.as_tensor(
+                        batch["aux_obstacle_mask"][mb_inds],
+                        dtype=torch.float32, device=device)
+                if "geodesic_dist" in aux_preds and "aux_geodesic_dist" in batch:
+                    aux_targets["geodesic_dist"] = torch.as_tensor(
+                        batch["aux_geodesic_dist"][mb_inds],
+                        dtype=torch.float32, device=device)
+
+                aux_losses = agent.aux_head_group.compute_losses(
+                    aux_preds, aux_targets)
+                for name, aloss in aux_losses.items():
+                    loss = loss + args.aux_coef * aloss
+                    aux_loss_accum[name].append(aloss.item())
+
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             nn.utils.clip_grad_norm_(agent.trainable_parameters(), args.max_grad_norm)
@@ -197,7 +241,7 @@ def ppo_update(agent, optimizer, batch, args, num_steps, num_envs,
             stopped_epoch = epoch + 1
             break
 
-    return {
+    result = {
         "pg_loss": np.mean(pg_losses),
         "vf_loss": np.mean(v_losses),
         "entropy": -np.mean(ent_losses),
@@ -205,6 +249,10 @@ def ppo_update(agent, optimizer, batch, args, num_steps, num_envs,
         "approx_kl": np.mean(approx_kls),
         "stopped_epoch": stopped_epoch,
     }
+    for name, vals in aux_loss_accum.items():
+        if vals:
+            result[f"aux_{name}_loss"] = np.mean(vals)
+    return result
 
 
 
@@ -340,6 +388,14 @@ def train(args):
     n_action_history = args.n_action_history
     action_history_dim = n_action_history * action_dim
 
+    # ── auxiliary heads ──
+    aux_heads_list = []
+    if args.aux_heads:
+        if args.aux_heads == "all":
+            aux_heads_list = ["occupancy", "obstacle_pos", "geodesic_dist"]
+        else:
+            aux_heads_list = [h.strip() for h in args.aux_heads.split(",")]
+
     # ── agent ──
     use_goal_only = args.agent == "goal_only"
     if use_goal_only:
@@ -359,6 +415,10 @@ def train(args):
             goal_mode=args.goal_mode,
             norm_obs=args.norm_obs,
             encoder_type=args.encoder_type,
+            aux_heads=aux_heads_list if aux_heads_list else None,
+            aux_detach=args.aux_detach,
+            aux_grid_size=args.aux_grid_size,
+            aux_max_objects=args.aux_max_objects,
         ).to(device)
     optimizer = torch.optim.Adam(agent.trainable_parameters(), lr=args.lr, eps=1e-8)
 
@@ -390,6 +450,9 @@ def train(args):
                 "goal_only_hidden": args.goal_only_hidden if use_goal_only else None,
                 "goal_only_layers": args.goal_only_layers if use_goal_only else None,
                 "n_action_history": n_action_history,
+                "aux_heads": aux_heads_list or None,
+                "aux_coef": args.aux_coef if aux_heads_list else None,
+                "aux_detach": args.aux_detach if aux_heads_list else None,
             },
         )
         print("W&B logging enabled.")
@@ -413,6 +476,9 @@ def train(args):
         num_steps, num_envs, obs_shape, cord_shape, action_dim,
         num_tokens, obs_feat_dim, device,
         action_history_dim=action_history_dim,
+        aux_heads=aux_heads_list,
+        aux_grid_size=args.aux_grid_size,
+        aux_max_objects=args.aux_max_objects,
     )
 
     # ── episode tracker ──
@@ -422,6 +488,10 @@ def train(args):
     obs_dict, initial_infos = vec_env.reset()
     lstm_state = agent.get_initial_lstm_state(num_envs, device)
     global_step = 0
+
+    # Enable auxiliary target collection in env subprocesses
+    if aux_heads_list:
+        vec_env.set_collect_aux_targets(True)
     best_reward = -float("inf")
 
     # ── weather & geodesic tracking ──
@@ -864,6 +934,8 @@ def train(args):
 
                 ep_tracker.step(rewards, dones, infos)
                 bufs.store_control_info(step, infos)
+                if aux_heads_list:
+                    bufs.store_aux_targets(step, infos)
                 bufs.raw_rewards[step] = np.copy(rewards)
 
                 # Truncation bootstrap
@@ -961,7 +1033,8 @@ def train(args):
                 stats = ppo_update(agent, optimizer, batch, args,
                                    num_steps, num_envs,
                                    initial_lstm_state, device,
-                                   use_goal_only=use_goal_only)
+                                   use_goal_only=use_goal_only,
+                                   aux_heads_list=aux_heads_list)
 
             # ── logging / checkpoint ──
             ep_stats = ep_tracker.flush()
@@ -1164,6 +1237,22 @@ if __name__ == "__main__":
     parser.add_argument("--norm_obs", action="store_true",
                         help="Apply LayerNorm to LSTM input features "
                              "(stabilizes training with frozen DINOv2 features)")
+    # auxiliary probing heads
+    parser.add_argument("--aux_heads", type=str, default=None,
+                        help="Comma-separated auxiliary heads to enable for LSTM "
+                             "probing: occupancy, obstacle_pos, geodesic_dist, "
+                             "or 'all' for all three. (default: disabled)")
+    parser.add_argument("--aux_coef", type=float, default=0.1,
+                        help="Loss weight for auxiliary head objectives")
+    parser.add_argument("--aux_detach", action="store_true",
+                        help="Detach LSTM hidden states before aux heads "
+                             "(probe-only mode — no gradient to backbone)")
+    parser.add_argument("--aux_grid_size", type=int, default=16,
+                        help="Occupancy grid resolution (default 16x16)")
+    parser.add_argument("--aux_range", type=float, default=8.0,
+                        help="Occupancy grid range in metres (default 8m)")
+    parser.add_argument("--aux_max_objects", type=int, default=8,
+                        help="Max object slots for obstacle position head")
     # checkpointing
     parser.add_argument("--save_dir", type=str, default="checkpoints/ppo")
     parser.add_argument("--save_every", type=int, default=100)

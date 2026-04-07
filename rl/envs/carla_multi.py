@@ -191,6 +191,13 @@ class CarlaMultiAgentEnv:
         self._collect_substep_frames = False
         self._substep_frames: List[list] = [[] for _ in range(num_agents)]
 
+        # Auxiliary targets for LSTM probing (enabled at runtime)
+        self._collect_aux_targets = False
+        self._aux_grid_size = 16
+        self._aux_range_m = 8.0
+        self._aux_max_objects = 8
+        self._aux_obj_range_m = 20.0
+
         # CCTV cameras (persistent sensors for vis iterations)
         self._cctv_cameras: List = []
         self._cctv_queues: List = []
@@ -1116,6 +1123,14 @@ class CarlaMultiAgentEnv:
                 ped_pos = [p['position_std'] for p in ped_layout.get('pedestrians', [])]
                 info['pedestrian_positions_std'] = (
                     np.stack(ped_pos) if ped_pos else np.empty((0, 2)))
+
+            # Auxiliary targets for LSTM probing heads
+            if self._collect_aux_targets:
+                info['aux_occupancy'] = self._get_local_occupancy(i)
+                obj_pos, obj_mask = self._get_relative_object_positions(i)
+                info['aux_obstacle_pos'] = obj_pos
+                info['aux_obstacle_mask'] = obj_mask
+
             infos.append(info)
 
             if terminated or truncated:
@@ -1248,6 +1263,97 @@ class CarlaMultiAgentEnv:
 
     def set_collect_substep_frames(self, enabled: bool):
         self._collect_substep_frames = enabled
+
+    def set_collect_aux_targets(self, enabled: bool):
+        self._collect_aux_targets = enabled
+
+    # ── Auxiliary target extraction (for LSTM probing heads) ─────────
+
+    def _get_local_occupancy(self, agent_idx):
+        """Extract ego-centric occupancy grid from the geodesic distance field.
+
+        Returns (G, G) float32 where 1=obstacle/unreachable, 0=free.
+        Rows = forward (0=behind, G-1=ahead), cols = right (0=left, G-1=right).
+        """
+        G = self._aux_grid_size
+        dist_field = self._geo_dists[agent_idx]
+        geo = self._geo_grids[agent_idx]
+        if dist_field is None or geo is None:
+            return np.zeros((G, G), dtype=np.float32)
+
+        xz = self._get_xz(agent_idx)
+        c2w_R = R.from_quat(self._get_pose(agent_idx)[3:])
+
+        # Camera axes projected onto the standard xz-plane
+        forward_std = c2w_R.apply([0, 0, 1])[[0, 2]]
+        right_std = c2w_R.apply([1, 0, 0])[[0, 2]]
+
+        rm = self._aux_range_m
+        cell = 2 * rm / G
+        idx = np.arange(G) - G / 2 + 0.5
+        fwd, rgt = np.meshgrid(idx * cell, idx * cell, indexing='ij')
+
+        # World positions for each grid cell
+        wx = xz[0] + fwd * forward_std[0] + rgt * right_std[0]
+        wz = xz[1] + fwd * forward_std[1] + rgt * right_std[1]
+
+        cols = np.round((wx - geo._x_min) / geo._resolution).astype(int)
+        rows = np.round((wz - geo._z_min) / geo._resolution).astype(int)
+
+        valid = (rows >= 0) & (rows < geo._H) & (cols >= 0) & (cols < geo._W)
+        rows_c = np.clip(rows, 0, geo._H - 1)
+        cols_c = np.clip(cols, 0, geo._W - 1)
+
+        occ = np.ones((G, G), dtype=np.float32)
+        occ[valid] = np.isinf(dist_field[rows_c[valid], cols_c[valid]]).astype(
+            np.float32)
+        return occ
+
+    def _get_relative_object_positions(self, agent_idx):
+        """Ego-centric positions of K nearest obstacles and pedestrians.
+
+        Returns
+        -------
+        positions : (K, 2) float32 — (x_cam, z_cam) = (right, forward)
+        mask      : (K,)   float32 — 1.0 for valid slots, 0.0 for padding
+        """
+        K = self._aux_max_objects
+        positions = np.zeros((K, 2), dtype=np.float32)
+        mask = np.zeros(K, dtype=np.float32)
+
+        xz = self._get_xz(agent_idx)
+        c2w_R = R.from_quat(self._get_pose(agent_idx)[3:])
+        w2c_R = c2w_R.inv()
+
+        # Collect positions in standard coords
+        parts = []
+        obs_ue = getattr(self, '_cached_obs_pos_ue', np.empty((0, 2)))
+        if obs_ue.shape[0] > 0:
+            parts.append(np.column_stack([obs_ue[:, 1], obs_ue[:, 0]]))
+        ped_ue = self.ped_mgr.get_pedestrian_positions_ue()
+        if ped_ue.shape[0] > 0:
+            parts.append(np.column_stack([ped_ue[:, 1], ped_ue[:, 0]]))
+        if not parts:
+            return positions, mask
+
+        all_std = np.concatenate(parts, axis=0)
+        rel = all_std - xz[None, :]
+        dists = np.linalg.norm(rel, axis=1)
+        keep = dists < self._aux_obj_range_m
+        rel, dists = rel[keep], dists[keep]
+        if len(dists) == 0:
+            return positions, mask
+
+        order = np.argsort(dists)[:K]
+        rel = rel[order]
+
+        # Vectorised world → ego rotation
+        rel_3d = np.column_stack([rel[:, 0], np.zeros(len(rel)), rel[:, 1]])
+        cam_3d = w2c_R.apply(rel_3d)
+        n = len(rel)
+        positions[:n] = cam_3d[:, [0, 2]].astype(np.float32)
+        mask[:n] = 1.0
+        return positions, mask
 
     # ── CCTV cameras (persistent sensors for vis iterations) ─────────
 

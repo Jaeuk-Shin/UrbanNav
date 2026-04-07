@@ -25,6 +25,12 @@ def log_metrics(iteration, num_iterations, global_step, bufs, stats,
         if "stopped_epoch" in stats and stats["stopped_epoch"] < stats.get("num_epochs", 999):
             kl_str += f"(stopped@{stats['stopped_epoch']})"
 
+    aux_str = ""
+    aux_parts = [f"{k}={v:.4f}" for k, v in stats.items()
+                 if k.startswith("aux_") and k.endswith("_loss")]
+    if aux_parts:
+        aux_str = "  " + "  ".join(aux_parts)
+
     print(
         f"[{iteration:4d}/{num_iterations}]  "
         f"steps={global_step:>8d}  "
@@ -39,6 +45,7 @@ def log_metrics(iteration, num_iterations, global_step, bufs, stats,
         f"t={iter_time:.1f}s  "
         f"total={h}:{m:02d}:{s:02d}  "
         f"SPS={sps}"
+        f"{aux_str}"
     )
 
     if ep_stats is not None:
@@ -110,6 +117,10 @@ def log_metrics(iteration, num_iterations, global_step, bufs, stats,
             "time/total_time": total_time,
             "time/SPS": sps,
         }
+        # Auxiliary head losses
+        for k, v in stats.items():
+            if k.startswith("aux_") and k.endswith("_loss"):
+                log_dict[f"losses/{k}"] = v
         if ep_stats is not None:
             for k, v in ep_stats.items():
                 log_dict[f"episode/{k}"] = v
