@@ -131,7 +131,17 @@ class FlowMatchingFeat(nn.Module):
         dec_out = self.sa_decoder(tokens).mean(dim=1)
 
         dec_out = dec_out.repeat_interleave(num_samples, dim=0)
+
+        # TODO: truncated Gaussian
         xt = torch.randn((B * num_samples, 12, 2), device=device)
+
+        noise = xt.detach().cpu().numpy()
+        noise = np.reshape(noise, (B, num_samples, 12, 2))
+
+        info = {
+            'noise': noise
+        }
+
 
         dt = 1.0 / num_inference_steps
         for i in range(num_inference_steps):
@@ -142,4 +152,4 @@ class FlowMatchingFeat(nn.Module):
 
         wp_pred = xt[:, :self.len_traj_pred]
         wp_pred = torch.cumsum(wp_pred, dim=1)
-        return wp_pred.view(B, num_samples, self.len_traj_pred, 2)
+        return wp_pred.view(B, num_samples, self.len_traj_pred, 2), info

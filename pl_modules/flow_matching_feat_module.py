@@ -66,10 +66,10 @@ class FlowMatchingFeatModule(pl.LightningModule):
         self.log('val/velocity_loss', velocity_loss,
                  on_step=False, on_epoch=True, prog_bar=False, sync_dist=True)
 
-        wp_preds = self.model.sample(obs_features, cord, num_samples=200)
+        wp_preds, info = self.model.sample(obs_features, cord, num_samples=200)
         wp_preds = wp_preds * batch['step_scale'].unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
 
-        self.process_visualization(mode='val', batch=batch, wp_pred=wp_preds)
+        self.process_visualization(mode='val', batch=batch, wp_pred=wp_preds, noise=info['noise'])
         return velocity_loss
 
     # ------------------------------------------------------------------
@@ -142,7 +142,7 @@ class FlowMatchingFeatModule(pl.LightningModule):
     # Visualization
     # ------------------------------------------------------------------
 
-    def process_visualization(self, mode, batch, wp_pred):
+    def process_visualization(self, mode, batch, wp_pred, noise: np.ndarray | None = None):
         if mode == 'val':
             num_visualize = self.val_num_visualize
             vis_dir = os.path.join(
@@ -167,7 +167,10 @@ class FlowMatchingFeatModule(pl.LightningModule):
             original_input_positions = batch['original_input_positions'][idx].cpu().numpy()
             noisy_input_positions = batch['noisy_input_positions'][idx].cpu().numpy()
             gt_waypoints = batch['gt_waypoints'][idx].cpu().numpy()
-            pred_waypoints = wp_pred[idx].detach().cpu().numpy()
+            pred_waypoints = wp_pred[idx].detach().cpu().numpy()                
+
+            noise_vectors = noise[idx]
+
 
             # Check if a raw image is available for this sample
             has_image = (
@@ -218,7 +221,7 @@ class FlowMatchingFeatModule(pl.LightningModule):
                     gt_waypoints, pred_waypoints,
                     batch['gt_waypoints_y'][idx].cpu().numpy(),
                     fx=fx, fy=fy, cx=cx, cy=cy,
-                    desired_width=dw, desired_height=dh,
+                    desired_width=dw, desired_height=dh, noise=noise
                 )
             else:
                 fig, ax_coord = plt.subplots(figsize=(6, 6))
@@ -246,13 +249,23 @@ class FlowMatchingFeatModule(pl.LightningModule):
 
     def _draw_image_panel(self, ax, img, gt_waypoints, pred_waypoints,
                           gt_waypoints_y, *, fx, fy, cx, cy,
-                          desired_width, desired_height):
-        """Render the raw image with projected waypoint overlays.
+                          desired_width, desired_height, noise: np.ndarray | None = None):
+        """
+        Render the raw image with projected waypoint overlays.
 
         Parameters
         ----------
         img : PIL.Image.Image
-            The raw RGB frame (from file or video extraction).
+            raw RGB frame (from file or video extraction)
+        gt_waypoints, pred_waypoints, gt_waypoints_y: np.ndarray
+            coordinates expressed in camera frame
+        fx, fy, cx, cy: float
+            intrinsic parameters
+        desired_width, desired_height: float
+            input rgb size (DINO)
+        noise: np.ndarray
+            shape: (sample size, 12, 2), where 12: padded length (1d conditional Unet)
+
         """
         W_orig, H_orig = img.size
 
@@ -273,7 +286,15 @@ class FlowMatchingFeatModule(pl.LightningModule):
         K = np.array([[fx, 0., cx], [0., fy, cy], [0., 0., 1.]])
 
         def shift(u, v):
+            # coordinate translation taking into account crop offset
             return u - left, v - top
+
+        # 2-norm of noise vectors
+        # shape: (sample size,)
+        noise_norm = np.sum(noise ** 2, axis=(-2, -1)) ** .5
+
+        # color value \propto density
+        color_val = np.exp(-.5 * noise_norm)
 
         # Ground-truth waypoints
         u_gt, v_gt, valid = project_waypoints_onto_image_plane(
@@ -282,14 +303,17 @@ class FlowMatchingFeatModule(pl.LightningModule):
         if np.all(valid):
             ax.plot(u_gt, v_gt, color='#92DB58', linewidth=3)
 
+        cmap = plt.get_cmap('plasma')
+
         # Predicted waypoints
         if pred_waypoints.ndim == 3:
             for s in range(pred_waypoints.shape[0]):
+                # iterate over samples
                 u_p, v_p, valid = project_waypoints_onto_image_plane(
                     pred_waypoints[s], gt_waypoints_y, K=K)
                 u_p, v_p = shift(u_p, v_p)
                 if np.all(valid):
-                    ax.plot(u_p, v_p, color='#DB6057', alpha=0.8)
+                    ax.plot(u_p, v_p, color=cmap(color_val[s]))
         elif pred_waypoints.ndim == 2:
             u_p, v_p, valid = project_waypoints_onto_image_plane(
                 pred_waypoints, gt_waypoints_y, K=K)
@@ -319,12 +343,20 @@ class FlowMatchingFeatModule(pl.LightningModule):
         ax.plot(gt_waypoints[:, 0], gt_waypoints[:, 1],
                 'X-', label='GT Waypoints', color='#92DB58')
 
+        # 2-norm of noise vectors
+        # shape: (sample size,)
+        noise_norm = np.sum(noise ** 2, axis=(-2, -1)) ** .5
+
+        # color value \propto density
+        color_val = np.exp(-.5 * noise_norm)
+        cmap = plt.get_cmap('plasma')
+
         if pred_waypoints.ndim == 3:
             labeled = False
             for s in range(pred_waypoints.shape[0]):
                 label = 'Predicted' if not labeled else None
                 ax.plot(pred_waypoints[s, :, 0], pred_waypoints[s, :, 1],
-                        color='#DB6057', alpha=0.8, label=label)
+                        color=cmap(color_val[s]), label=label)
                 labeled = True
         elif pred_waypoints.ndim == 2:
             ax.plot(pred_waypoints[:, 0], pred_waypoints[:, 1],

@@ -81,12 +81,13 @@ def load_model(cfg, checkpoint_path):
 
 
 # ---------------------------------------------------------------------------
-# Empirical Wasserstein distance via optimal bipartite matching
+# Empirical Wasserstein distance via minimum-weight bipartite matching
 # ---------------------------------------------------------------------------
 
 def empirical_wasserstein(samples_a, samples_b):
-    """Compute the 1-Wasserstein distance between two empirical trajectory
-    distributions using minimum-weight bipartite matching (Hungarian algorithm).
+    """
+    compute the 1-Wasserstein distance between two empirical trajectory
+    distributions using Hungarian algorithm
 
     Parameters
     ----------
