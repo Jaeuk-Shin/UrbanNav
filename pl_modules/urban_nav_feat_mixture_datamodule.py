@@ -84,7 +84,7 @@ class UrbanNavFeatMixtureDataModule(pl.LightningDataModule):
         mixture = OmegaConf.to_container(self.cfg.data.mixture, resolve=True)
         weights = [entry['weight'] for entry in mixture]
 
-        if stage == 'fit' or stage is None:
+        if stage in ('fit', 'validate') or stage is None:
             train_datasets = []
             val_datasets = []
             for entry in mixture:
