@@ -1,11 +1,11 @@
 """Validation-only script — runs validation and saves visualizations without training.
 
 Usage:
-    python validate.py --config config/goal_agnostic_fm.yaml --checkpoint path/to/best.ckpt
-    python validate.py --config config/goal_agnostic_fm.yaml --checkpoint path/to/best.ckpt \
+    python validate.py --config config/urban_nav_feat.yaml --checkpoint path/to/best.ckpt
+    python validate.py --config config/urban_nav_feat.yaml --checkpoint path/to/best.ckpt \
         model.type=flow_matching_feat data.type=carla_feat
-    python validate.py --config config/goal_agnostic_fm.yaml --checkpoint path/to/best.ckpt \
-        validation.num_visualize=100
+    python validate.py --config config/urban_nav_feat.yaml --checkpoint path/to/best.ckpt \
+        validation.num_visualize=200
 
 Outputs are saved to {result_dir}/val_vis/epoch_0/.
 """

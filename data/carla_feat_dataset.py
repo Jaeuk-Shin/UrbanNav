@@ -39,12 +39,17 @@ class CarlaFeatDataset(Dataset):
         self.pose_step = max(1, self.pose_fps // self.target_fps)
         self.frame_step = self.video_fps // self.target_fps
 
-        # Load pose paths
+        # Load pose paths — sort first for determinism, then shuffle with a
+        # fixed seed so that train/val/test splits are random but reproducible.
+        # Without the shuffle the tail-slice val/test sets are biased toward
+        # whichever episodes sort last alphabetically.
         self.pose_path = [
             os.path.join(self.pose_dir, f)
             for f in sorted(os.listdir(self.pose_dir))
             if f.endswith('.txt')
         ]
+        rng = random.Random(42)
+        rng.shuffle(self.pose_path)
 
         if mode == 'train':
             self.pose_path = self.pose_path[:cfg.data.num_train]
