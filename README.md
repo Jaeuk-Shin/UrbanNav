@@ -23,7 +23,7 @@ Please see [dataset/README.md](./dataset/README.md) for details on how to prepar
 ## Training
 To train the model, run:
 ```
-python train.py --config config/goal_agnostic.yaml
+python train.py --config-name goal_agnostic
 ```
 
 ## Testing

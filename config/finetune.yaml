@@ -1,3 +1,5 @@
+checkpoint: null
+
 project:
   name: 'UrbanNav_Citywalk'
   run_name: 'finetune'

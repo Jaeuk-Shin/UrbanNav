@@ -1,3 +1,6 @@
+checkpoint: null
+perturbation: null
+
 project:
   name: 'CityWalker'
   run_name: 'carla_data'

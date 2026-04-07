@@ -1,3 +1,6 @@
+checkpoint: null
+perturbation: null
+
 project:
   name: 'base-model'
   run_name: 'urban_nav_feat_mix'

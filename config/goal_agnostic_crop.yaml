@@ -1,3 +1,5 @@
+checkpoint: null
+
 project:
   name: 'CityWalkerCrop'
   run_name: 'carla_data'
