@@ -6,6 +6,7 @@ from pytorch_lightning.strategies import DDPStrategy
 from pl_modules.citywalk_datamodule import CityWalkDataModule
 from pl_modules.carla_datamodule import CarlaDataModule
 from pl_modules.carla_feat_datamodule import CarlaFeatDataModule
+from pl_modules.urban_nav_feat_mixture_datamodule import UrbanNavFeatMixtureDataModule
 from pl_modules.distillation_module import DistillationModule
 from pl_modules.distillation_feat_module import DistillationFeatModule
 
@@ -31,6 +32,9 @@ def main(cfg):
         model = DistillationModule(cfg, teacher_ckpt)
     elif cfg.data.type == 'carla_feat':
         datamodule = CarlaFeatDataModule(cfg)
+        model = DistillationFeatModule(cfg, teacher_ckpt)
+    elif cfg.data.type == 'urban_nav_feat_mixture':
+        datamodule = UrbanNavFeatMixtureDataModule(cfg)
         model = DistillationFeatModule(cfg, teacher_ckpt)
     else:
         raise ValueError(f"Invalid dataset: {cfg.data.type}")
