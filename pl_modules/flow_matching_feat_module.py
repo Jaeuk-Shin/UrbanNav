@@ -10,6 +10,7 @@ import matplotlib
 import matplotlib.pyplot as plt
 matplotlib.use('Agg')
 import os
+import cv2
 
 
 class FlowMatchingFeatModule(pl.LightningModule):
@@ -247,9 +248,13 @@ class FlowMatchingFeatModule(pl.LightningModule):
         frame = vr[frame_idx].asnumpy()  # (H, W, 3) uint8
         return Image.fromarray(frame)
 
-    def _draw_image_panel(self, ax, img, gt_waypoints, pred_waypoints,
-                          gt_waypoints_y, *, fx, fy, cx, cy,
-                          desired_width, desired_height, noise: np.ndarray | None = None):
+    def _draw_image_panel(
+        self, ax, img,
+        gt_waypoints, pred_waypoints, gt_waypoints_y, *,
+        fx, fy, cx, cy,
+        desired_width, desired_height,
+        noise: np.ndarray | None = None
+        ):
         """
         Render the raw image with projected waypoint overlays.
 
@@ -282,7 +287,7 @@ class FlowMatchingFeatModule(pl.LightningModule):
         ax.imshow(np.array(img))
         ax.axis('off')
 
-        # Camera intrinsics
+        # camera matrix
         K = np.array([[fx, 0., cx], [0., fy, cy], [0., 0., 1.]])
 
         def shift(u, v):
@@ -294,16 +299,23 @@ class FlowMatchingFeatModule(pl.LightningModule):
         noise_norm = np.sum(noise ** 2, axis=(-2, -1)) ** .5
 
         # color value \propto density
-        color_val = np.exp(-.5 * noise_norm)
+        color_values = np.exp(-.5 * noise_norm)
 
-        # Ground-truth waypoints
+        cmap = plt.get_cmap('plasma')
+        colors = cmap(color_values)
+
+        '''
+        points = np.insert(gt_waypoints, 1, gt_waypoints_y, axis=-1)
+        points[..., 1] += 1.8
+        image_edges = project_curves_onto_image_plane(points, camera_matrix=K, z_near=1e-3)
+        image_edges -= np.array([left, top])
+        '''
+
         u_gt, v_gt, valid = project_waypoints_onto_image_plane(
             gt_waypoints, gt_waypoints_y, K=K)
         u_gt, v_gt = shift(u_gt, v_gt)
         if np.all(valid):
             ax.plot(u_gt, v_gt, color='#92DB58', linewidth=3)
-
-        cmap = plt.get_cmap('plasma')
 
         # Predicted waypoints
         if pred_waypoints.ndim == 3:
@@ -323,6 +335,7 @@ class FlowMatchingFeatModule(pl.LightningModule):
 
         ax.set_xlim(0.0, dw)
         ax.set_ylim(dh, 0.0)
+        return
 
     def _draw_coord_panel(self, ax, original_input, noisy_input, gt_waypoints,
                           pred_waypoints, *, fov=None):
@@ -350,6 +363,7 @@ class FlowMatchingFeatModule(pl.LightningModule):
         # color value \propto density
         color_val = np.exp(-.5 * noise_norm)
         cmap = plt.get_cmap('plasma')
+
 
         if pred_waypoints.ndim == 3:
             labeled = False
@@ -397,3 +411,67 @@ class FlowMatchingFeatModule(pl.LightningModule):
         if unexpected:
             print(f"[from_image_checkpoint] Unexpected keys (skipped): {unexpected}")
         return module
+
+
+def project_curves_onto_image_plane(points, colors, camera_matrix, z_near=1e-2):
+    """
+    Returns a set of edges on the image plane; has shape (*, 2, 2).
+
+    Parameters
+    ----------
+    points: np.ndarray of shape (*, # of vertices, 3), where the last two dimensions represent a PL curve
+            (v[0], v[1], ...,  v[n]), where n: curve length
+            Must be represented in the camera frame.
+    colors: np.ndarray of shape (*, 4) containing RGBA values
+            one color per curve
+    """
+    
+    # vertices -> edges: e_in[i] := v[i] / e_out[i] := v[i+1]
+    # (*, # of edges, 3)
+    e_in = np.copy(points[..., :-1, :])
+    e_out = np.copy(points[..., 1:, :])
+
+    n_edges = e_in.shape[-2]
+
+    points_z = points[..., -1]      # z-coordinates
+
+    in_front = points_z >= z_near
+    f_in, f_out = in_front[..., :-1], in_front[..., 1:]     # (*, # of edges)
+
+    fb = f_in & ~f_out      # (front, back)
+    bf = ~f_in & f_out      # (back, front)
+
+    visible = f_in | f_out
+    visible = visible.reshape((-1,))
+
+    # interpolation (intersection with z = z_near)
+    z0, z1 = e_in[bf, -1], e_out[bf, -1]
+    t = (z_near - z0) / (z1 - z0)
+    e_in[bf] = (1. - t) * e_in[bf] + t * e_out[bf]
+
+    z0, z1 = e_out[fb, -1], e_in[fb, -1]
+    t = (z_near - z0) / (z1 - z0)
+    e_out[fb] = (1. - t) * e_out[fb] + t * e_in[fb]
+
+    edges_clipped = np.stack((e_in, e_out), axis=-2)    # (*, # of edges, 2, 3)
+
+    edges_clipped = edges_clipped.reshape((-1, 2, 3))
+    edges_in_front = edges_clipped[visible]
+    
+    colors = np.tile(colors[..., np.newaxis, :], n_edges, axis=-2)      # (*, # of edges, 3)
+    colors = colors.reshape((-1, 3))
+    colors = colors[visible]
+    points_in_front = edges_in_front.reshape((-1, 3))    # flatten
+
+    # arguments: object points, rvec, tvec, camera matrix, distortion coefficients
+    # image_points, _ = cv2.projectPoints(points_in_front, np.zeros(3), np.zeros(3), camera_matrix, np.zeros(5))
+    points_img = points_in_front @ K.T
+    x_img, y_img, z_img = np.split(points_img, 3, axis=-1)
+    u, v = x_img / z_img, y_img / z_img
+
+    image_points = np.stack((u, v), axis=-1)
+    image_edges = image_points.reshape((-1, 2, 2))
+    line_collection = LineCollection(image_edges, colors=colors, linewidths=2)
+
+
+    return line_collection
