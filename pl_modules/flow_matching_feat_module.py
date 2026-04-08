@@ -325,7 +325,7 @@ class FlowMatchingFeatModule(pl.LightningModule):
                     pred_waypoints[s], gt_waypoints_y, K=K)
                 u_p, v_p = shift(u_p, v_p)
                 if np.all(valid):
-                    ax.plot(u_p, v_p, color=cmap(color_val[s]))
+                    ax.plot(u_p, v_p, color=colors[s])
         elif pred_waypoints.ndim == 2:
             u_p, v_p, valid = project_waypoints_onto_image_plane(
                 pred_waypoints, gt_waypoints_y, K=K)
@@ -361,16 +361,16 @@ class FlowMatchingFeatModule(pl.LightningModule):
         noise_norm = np.sum(noise ** 2, axis=(-2, -1)) ** .5
 
         # color value \propto density
-        color_val = np.exp(-.5 * noise_norm)
+        color_values = np.exp(-.5 * noise_norm)
         cmap = plt.get_cmap('plasma')
-
+        colors = cmap(color_values)
 
         if pred_waypoints.ndim == 3:
             labeled = False
             for s in range(pred_waypoints.shape[0]):
                 label = 'Predicted' if not labeled else None
                 ax.plot(pred_waypoints[s, :, 0], pred_waypoints[s, :, 1],
-                        color=cmap(color_val[s]), label=label)
+                        color=colors[s], label=label)
                 labeled = True
         elif pred_waypoints.ndim == 2:
             ax.plot(pred_waypoints[:, 0], pred_waypoints[:, 1],
