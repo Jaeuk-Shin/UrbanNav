@@ -230,7 +230,7 @@ class FlowMatchingFeatModule(pl.LightningModule):
             # -- Coordinate plot (always shown) --
             self._draw_coord_panel(
                 ax_coord, original_input_positions, noisy_input_positions,
-                gt_waypoints, pred_waypoints, fov=fov,
+                gt_waypoints, pred_waypoints, fov=fov, noise=noise
             )
 
             plt.savefig(os.path.join(vis_dir, f'sample_{self.vis_count}.png'))
@@ -294,15 +294,16 @@ class FlowMatchingFeatModule(pl.LightningModule):
             # coordinate translation taking into account crop offset
             return u - left, v - top
 
+        if noise is not None:
         # 2-norm of noise vectors
         # shape: (sample size,)
-        noise_norm = np.sum(noise ** 2, axis=(-2, -1)) ** .5
+            noise_norm = np.sum(noise ** 2, axis=(-2, -1)) ** .5
 
-        # color value \propto density
-        color_values = np.exp(-.5 * noise_norm)
+            # color value \propto density
+            color_values = np.exp(-.5 * noise_norm)
 
-        cmap = plt.get_cmap('plasma')
-        colors = cmap(color_values)
+            cmap = plt.get_cmap('plasma')
+            colors = cmap(color_values)
 
         '''
         points = np.insert(gt_waypoints, 1, gt_waypoints_y, axis=-1)
@@ -321,11 +322,12 @@ class FlowMatchingFeatModule(pl.LightningModule):
         if pred_waypoints.ndim == 3:
             for s in range(pred_waypoints.shape[0]):
                 # iterate over samples
+                color = colors[s] if noise is not None else '#DB6057'
                 u_p, v_p, valid = project_waypoints_onto_image_plane(
                     pred_waypoints[s], gt_waypoints_y, K=K)
                 u_p, v_p = shift(u_p, v_p)
                 if np.all(valid):
-                    ax.plot(u_p, v_p, color=colors[s])
+                    ax.plot(u_p, v_p, color=color)
         elif pred_waypoints.ndim == 2:
             u_p, v_p, valid = project_waypoints_onto_image_plane(
                 pred_waypoints, gt_waypoints_y, K=K)
@@ -338,7 +340,7 @@ class FlowMatchingFeatModule(pl.LightningModule):
         return
 
     def _draw_coord_panel(self, ax, original_input, noisy_input, gt_waypoints,
-                          pred_waypoints, *, fov=None):
+                          pred_waypoints, *, fov=None, noise=None):
         """Render the 2-D coordinate trajectory plot."""
         if fov is not None:
             th = np.pi / 2.0 - np.deg2rad(fov) / 2.0
@@ -358,19 +360,22 @@ class FlowMatchingFeatModule(pl.LightningModule):
 
         # 2-norm of noise vectors
         # shape: (sample size,)
-        noise_norm = np.sum(noise ** 2, axis=(-2, -1)) ** .5
+        if noise is not None:
+            noise_norm = np.sum(noise ** 2, axis=(-2, -1)) ** .5
 
-        # color value \propto density
-        color_values = np.exp(-.5 * noise_norm)
-        cmap = plt.get_cmap('plasma')
-        colors = cmap(color_values)
+            # color value \propto density
+            color_values = np.exp(-.5 * noise_norm)
+            cmap = plt.get_cmap('plasma')
+            colors = cmap(color_values)
 
         if pred_waypoints.ndim == 3:
             labeled = False
             for s in range(pred_waypoints.shape[0]):
+                color = colors[s] if noise is not None else '#DB6057'
+
                 label = 'Predicted' if not labeled else None
                 ax.plot(pred_waypoints[s, :, 0], pred_waypoints[s, :, 1],
-                        color=colors[s], label=label)
+                        color=color, label=label)
                 labeled = True
         elif pred_waypoints.ndim == 2:
             ax.plot(pred_waypoints[:, 0], pred_waypoints[:, 1],
