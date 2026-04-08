@@ -222,7 +222,7 @@ class FlowMatchingFeatModule(pl.LightningModule):
                     gt_waypoints, pred_waypoints,
                     batch['gt_waypoints_y'][idx].cpu().numpy(),
                     fx=fx, fy=fy, cx=cx, cy=cy,
-                    desired_width=dw, desired_height=dh, noise=noise
+                        desired_width=dw, desired_height=dh, noise=noise_vectors
                 )
             else:
                 fig, ax_coord = plt.subplots(figsize=(6, 6))
@@ -230,7 +230,7 @@ class FlowMatchingFeatModule(pl.LightningModule):
             # -- Coordinate plot (always shown) --
             self._draw_coord_panel(
                 ax_coord, original_input_positions, noisy_input_positions,
-                gt_waypoints, pred_waypoints, fov=fov, noise=noise
+                gt_waypoints, pred_waypoints, fov=fov, noise=noise_vectors
             )
 
             plt.savefig(os.path.join(vis_dir, f'sample_{self.vis_count}.png'))
@@ -278,22 +278,24 @@ class FlowMatchingFeatModule(pl.LightningModule):
         dh = int(desired_height)
 
         # Center-crop offset (used to shift projected coords into crop space)
-        left = max(0, (W_orig - dw) // 2)
-        top = max(0, (H_orig - dh) // 2)
-
+        # < 0: padd / > 0: crop
+        left, right = (W_orig - dw) // 2, (W_orig + dw) // 2
+        top, bottom = (H_orig - dh) // 2, (H_orig + dh) // 2
+        '''
         if W_orig != dw or H_orig != dh:
             img = img.crop((left, top, left + dw, top + dh))
-
+        '''
         ax.imshow(np.array(img))
         ax.axis('off')
 
         # camera matrix
         K = np.array([[fx, 0., cx], [0., fy, cy], [0., 0., 1.]])
 
+        '''
         def shift(u, v):
             # coordinate translation taking into account crop offset
             return u - left, v - top
-
+        '''
         if noise is not None:
         # 2-norm of noise vectors
         # shape: (sample size,)
@@ -314,7 +316,7 @@ class FlowMatchingFeatModule(pl.LightningModule):
 
         u_gt, v_gt, valid = project_waypoints_onto_image_plane(
             gt_waypoints, gt_waypoints_y, K=K)
-        u_gt, v_gt = shift(u_gt, v_gt)
+        # u_gt, v_gt = shift(u_gt, v_gt)
         if np.all(valid):
             ax.plot(u_gt, v_gt, color='#92DB58', linewidth=3)
 
@@ -325,18 +327,18 @@ class FlowMatchingFeatModule(pl.LightningModule):
                 color = colors[s] if noise is not None else '#DB6057'
                 u_p, v_p, valid = project_waypoints_onto_image_plane(
                     pred_waypoints[s], gt_waypoints_y, K=K)
-                u_p, v_p = shift(u_p, v_p)
+                # u_p, v_p = shift(u_p, v_p)
                 if np.all(valid):
                     ax.plot(u_p, v_p, color=color)
         elif pred_waypoints.ndim == 2:
             u_p, v_p, valid = project_waypoints_onto_image_plane(
                 pred_waypoints, gt_waypoints_y, K=K)
-            u_p, v_p = shift(u_p, v_p)
+            # u_p, v_p = shift(u_p, v_p)
             if np.all(valid):
                 ax.plot(u_p, v_p, color='#DB6057')
 
-        ax.set_xlim(0.0, dw)
-        ax.set_ylim(dh, 0.0)
+        ax.set_xlim(left, right)
+        ax.set_ylim(top, bottom)
         return
 
     def _draw_coord_panel(self, ax, original_input, noisy_input, gt_waypoints,
