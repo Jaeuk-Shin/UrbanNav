@@ -306,20 +306,26 @@ class FlowMatchingFeatModule(pl.LightningModule):
 
             cmap = plt.get_cmap('plasma')
             colors = cmap(color_values)
+        else:
+            colors = matploblib.color.to_rgba('#DB6057')
 
-        '''
-        points = np.insert(gt_waypoints, 1, gt_waypoints_y, axis=-1)
-        points[..., 1] += 1.8
-        image_edges = project_curves_onto_image_plane(points, camera_matrix=K, z_near=1e-3)
-        image_edges -= np.array([left, top])
-        '''
+
+        curves_pred = np.insert(pred_waypoints, 1, gt_waypoints_y, axis=-1)
+        curves_pred[..., 1] += 1.8
+        line_collection = project_curves_onto_image_plane(
+            curves_pred,
+            colors,
+            camera_matrix=K,
+            z_near=1e-3
+        )
+        
 
         u_gt, v_gt, valid = project_waypoints_onto_image_plane(
             gt_waypoints, gt_waypoints_y, K=K)
         # u_gt, v_gt = shift(u_gt, v_gt)
         if np.all(valid):
             ax.plot(u_gt, v_gt, color='#92DB58', linewidth=3)
-
+        '''
         # Predicted waypoints
         if pred_waypoints.ndim == 3:
             for s in range(pred_waypoints.shape[0]):
@@ -336,10 +342,12 @@ class FlowMatchingFeatModule(pl.LightningModule):
             # u_p, v_p = shift(u_p, v_p)
             if np.all(valid):
                 ax.plot(u_p, v_p, color='#DB6057')
-
+        '''
+        # crop/pad
         ax.set_xlim(left, right)
-        ax.set_ylim(top, bottom)
+        ax.set_ylim(bottom, top)
         return
+
 
     def _draw_coord_panel(self, ax, original_input, noisy_input, gt_waypoints,
                           pred_waypoints, *, fov=None, noise=None):
