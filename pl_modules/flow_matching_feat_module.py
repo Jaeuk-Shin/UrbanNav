@@ -6,9 +6,11 @@ from omegaconf import OmegaConf
 from model.flow_matching_feat import FlowMatchingFeat
 from vis_utils import project_waypoints_onto_image_plane
 from PIL import Image
-import matplotlib
+import matplotlib as mpl
 import matplotlib.pyplot as plt
-matplotlib.use('Agg')
+from matplotlib.collections import LineCollection
+from matplotlib.colors import to_rgba
+mpl.use('Agg')
 import os
 import cv2
 
@@ -170,8 +172,25 @@ class FlowMatchingFeatModule(pl.LightningModule):
             gt_waypoints = batch['gt_waypoints'][idx].cpu().numpy()
             pred_waypoints = wp_pred[idx].detach().cpu().numpy()                
 
-            noise_vectors = noise[idx]
+            # |z|_2
+            d = noise.shape[-2] * noise.shape[-1]
+            squared_norms = np.sum(noise[idx] ** 2, axis=(-2, -1))            
+            # -|z|^2_2 / 2 - d / 2 log (2\pi)
+            log_densities = -.5 * (squared_norms + d * np.log(2. * np.pi))
 
+            
+            neg_ent = -.5 * d * (1. + np.log(2. * np.pi))  # -H[X] = E[log p(X)]
+            # concentration bounds; see Lemma 1 of [Laurent & Massart, 2000]
+            DELTA = 1e-2        # confidence level
+            t = np.log(2. / DELTA)
+            radius = np.sqrt(t * d)
+            # [-sqrt(td) - t, sqrt(td)]
+            lb = neg_ent - radius
+            ub = neg_ent + radius
+            # normalization; fall into [0, 1]
+            log_densities = (log_densities - lb) / (ub - lb)
+            # clipping
+            log_densities = np.clip(log_densities, 0., 1.)
 
             # Check if a raw image is available for this sample
             has_image = (
@@ -217,20 +236,20 @@ class FlowMatchingFeatModule(pl.LightningModule):
             if img is not None and has_camera:
                 fig, (ax_img, ax_coord) = plt.subplots(1, 2, figsize=(12, 6))
                 plt.subplots_adjust(wspace=0.3)
-                self._draw_image_panel(
+                draw_image_panel(
                     ax_img, img,
                     gt_waypoints, pred_waypoints,
                     batch['gt_waypoints_y'][idx].cpu().numpy(),
                     fx=fx, fy=fy, cx=cx, cy=cy,
-                        desired_width=dw, desired_height=dh, noise=noise_vectors
+                        desired_width=dw, desired_height=dh, densities=log_densities
                 )
             else:
                 fig, ax_coord = plt.subplots(figsize=(6, 6))
 
             # -- Coordinate plot (always shown) --
-            self._draw_coord_panel(
-                ax_coord, original_input_positions, noisy_input_positions,
-                gt_waypoints, pred_waypoints, fov=fov, noise=noise_vectors
+            draw_coord_panel(
+                fig, ax_coord, original_input_positions, noisy_input_positions,
+                gt_waypoints, pred_waypoints, fov=fov, densities=log_densities
             )
 
             plt.savefig(os.path.join(vis_dir, f'sample_{self.vis_count}.png'))
@@ -247,155 +266,6 @@ class FlowMatchingFeatModule(pl.LightningModule):
         frame_idx = min(frame_idx, len(vr) - 1)
         frame = vr[frame_idx].asnumpy()  # (H, W, 3) uint8
         return Image.fromarray(frame)
-
-    def _draw_image_panel(
-        self, ax, img,
-        gt_waypoints, pred_waypoints, gt_waypoints_y, *,
-        fx, fy, cx, cy,
-        desired_width, desired_height,
-        noise: np.ndarray | None = None
-        ):
-        """
-        Render the raw image with projected waypoint overlays.
-
-        Parameters
-        ----------
-        img : PIL.Image.Image
-            raw RGB frame (from file or video extraction)
-        gt_waypoints, pred_waypoints, gt_waypoints_y: np.ndarray
-            coordinates expressed in camera frame
-        fx, fy, cx, cy: float
-            intrinsic parameters
-        desired_width, desired_height: float
-            input rgb size (DINO)
-        noise: np.ndarray
-            shape: (sample size, 12, 2), where 12: padded length (1d conditional Unet)
-
-        """
-        W_orig, H_orig = img.size
-
-        dw = int(desired_width)
-        dh = int(desired_height)
-
-        # Center-crop offset (used to shift projected coords into crop space)
-        # < 0: padd / > 0: crop
-        left, right = (W_orig - dw) // 2, (W_orig + dw) // 2
-        top, bottom = (H_orig - dh) // 2, (H_orig + dh) // 2
-        '''
-        if W_orig != dw or H_orig != dh:
-            img = img.crop((left, top, left + dw, top + dh))
-        '''
-        ax.imshow(np.array(img))
-        ax.axis('off')
-
-        # camera matrix
-        K = np.array([[fx, 0., cx], [0., fy, cy], [0., 0., 1.]])
-
-        '''
-        def shift(u, v):
-            # coordinate translation taking into account crop offset
-            return u - left, v - top
-        '''
-        if noise is not None:
-        # 2-norm of noise vectors
-        # shape: (sample size,)
-            noise_norm = np.sum(noise ** 2, axis=(-2, -1)) ** .5
-
-            # color value \propto density
-            color_values = np.exp(-.5 * noise_norm)
-
-            cmap = plt.get_cmap('plasma')
-            colors = cmap(color_values)
-        else:
-            colors = matploblib.color.to_rgba('#DB6057')
-
-
-        curves_pred = np.insert(pred_waypoints, 1, gt_waypoints_y, axis=-1)
-        curves_pred[..., 1] += 1.8
-        line_collection = project_curves_onto_image_plane(
-            curves_pred,
-            colors,
-            camera_matrix=K,
-            z_near=1e-3
-        )
-        
-
-        u_gt, v_gt, valid = project_waypoints_onto_image_plane(
-            gt_waypoints, gt_waypoints_y, K=K)
-        # u_gt, v_gt = shift(u_gt, v_gt)
-        if np.all(valid):
-            ax.plot(u_gt, v_gt, color='#92DB58', linewidth=3)
-        '''
-        # Predicted waypoints
-        if pred_waypoints.ndim == 3:
-            for s in range(pred_waypoints.shape[0]):
-                # iterate over samples
-                color = colors[s] if noise is not None else '#DB6057'
-                u_p, v_p, valid = project_waypoints_onto_image_plane(
-                    pred_waypoints[s], gt_waypoints_y, K=K)
-                # u_p, v_p = shift(u_p, v_p)
-                if np.all(valid):
-                    ax.plot(u_p, v_p, color=color)
-        elif pred_waypoints.ndim == 2:
-            u_p, v_p, valid = project_waypoints_onto_image_plane(
-                pred_waypoints, gt_waypoints_y, K=K)
-            # u_p, v_p = shift(u_p, v_p)
-            if np.all(valid):
-                ax.plot(u_p, v_p, color='#DB6057')
-        '''
-        # crop/pad
-        ax.set_xlim(left, right)
-        ax.set_ylim(bottom, top)
-        return
-
-
-    def _draw_coord_panel(self, ax, original_input, noisy_input, gt_waypoints,
-                          pred_waypoints, *, fov=None, noise=None):
-        """Render the 2-D coordinate trajectory plot."""
-        if fov is not None:
-            th = np.pi / 2.0 - np.deg2rad(fov) / 2.0
-            r = np.linspace(0.0, 7.0, num=100)
-            c, s = np.cos(th), np.sin(th)
-            ax.plot(r * c, r * s, linestyle='dashed', color='tab:gray',
-                    label='fov')
-            ax.plot(-r * c, r * s, linestyle='dashed', color='tab:gray')
-
-        ax.axis('equal')
-        ax.plot(original_input[:, 0], original_input[:, 1],
-                'o-', label='Original Input', color='#5771DB')
-        ax.plot(noisy_input[:, 0], noisy_input[:, 1],
-                'o-', label='Noisy Input', color='#DBC257')
-        ax.plot(gt_waypoints[:, 0], gt_waypoints[:, 1],
-                'X-', label='GT Waypoints', color='#92DB58')
-
-        # 2-norm of noise vectors
-        # shape: (sample size,)
-        if noise is not None:
-            noise_norm = np.sum(noise ** 2, axis=(-2, -1)) ** .5
-
-            # color value \propto density
-            color_values = np.exp(-.5 * noise_norm)
-            cmap = plt.get_cmap('plasma')
-            colors = cmap(color_values)
-
-        if pred_waypoints.ndim == 3:
-            labeled = False
-            for s in range(pred_waypoints.shape[0]):
-                color = colors[s] if noise is not None else '#DB6057'
-
-                label = 'Predicted' if not labeled else None
-                ax.plot(pred_waypoints[s, :, 0], pred_waypoints[s, :, 1],
-                        color=color, label=label)
-                labeled = True
-        elif pred_waypoints.ndim == 2:
-            ax.plot(pred_waypoints[:, 0], pred_waypoints[:, 1],
-                    's-', label='Predicted', color='#DB6057')
-
-        ax.legend()
-        ax.set_title('Coordinates')
-        ax.set_xlabel('X (m)')
-        ax.set_ylabel('Z (m)')
-        ax.grid(True)
 
     # ------------------------------------------------------------------
     # Utility: load weights from image-based checkpoint
@@ -426,6 +296,123 @@ class FlowMatchingFeatModule(pl.LightningModule):
         if unexpected:
             print(f"[from_image_checkpoint] Unexpected keys (skipped): {unexpected}")
         return module
+
+
+
+def draw_coord_panel(fig, ax, original_input, noisy_input, gt_waypoints,
+                        pred_waypoints, *, fov=None, densities=None):
+    """Render the 2-D coordinate trajectory plot."""
+    if fov is not None:
+        th = (np.pi - np.deg2rad(fov)) / 2.0
+        r = np.linspace(0.0, 7.0, num=100)
+        c, s = np.cos(th), np.sin(th)
+        ax.plot(r * c, r * s, linestyle='dashed', color='tab:gray',
+                label='fov')
+        ax.plot(-r * c, r * s, linestyle='dashed', color='tab:gray')
+    # add the origin to the beginning of each trajectory
+    gt_waypoints = np.insert(gt_waypoints, 0, values=0., axis=0)
+    pred_waypoints = np.insert(pred_waypoints, 0, values=0., axis=-2)
+    
+    ax.plot(original_input[:, 0], original_input[:, 1],
+            'o-', label='Original Input', color='#5771DB', zorder=2)
+    ax.plot(noisy_input[:, 0], noisy_input[:, 1],
+            'o-', label='Noisy Input', color='#DBC257', zorder=2)
+    ax.plot(gt_waypoints[:, 0], gt_waypoints[:, 1],
+            'X-', label='GT Waypoints', color='#92DB58', zorder=2)
+
+    if densities is not None:
+        cmap = plt.get_cmap('coolwarm')
+        colors = cmap(densities)        # RGBA
+        # colors[..., -1] = densities     # alpha proportional to density
+
+    line_collection = LineCollection(pred_waypoints, colors=colors, linewidth=2., label='Predicted', zorder=1)
+    ax.add_collection(line_collection)
+
+    fig.colorbar(mpl.cm.ScalarMappable(norm=mpl.colors.Normalize(0, 1), cmap='coolwarm'),
+            ax=ax, orientation='vertical', label='normalized log density')
+
+    ax.legend()
+    ax.set_title('Coordinates')
+    ax.set_xlabel('X (m)')
+    ax.set_ylabel('Z (m)')
+    ax.grid(True)
+    ax.axis('equal')
+    return
+
+
+def draw_image_panel(
+    ax, img,
+    gt_waypoints, pred_waypoints, gt_waypoints_y, *,
+    fx, fy, cx, cy,
+    desired_width, desired_height,
+    densities: np.ndarray | None = None
+    ):
+    """
+    Render the raw image with projected waypoint overlays.
+
+    Parameters
+    ----------
+    img : PIL.Image.Image
+        raw RGB frame (from file or video extraction)
+    gt_waypoints, pred_waypoints, gt_waypoints_y: np.ndarray
+        coordinates expressed in camera frame
+    fx, fy, cx, cy: float
+        intrinsic parameters
+    desired_width, desired_height: float
+        input rgb size (DINO)
+    densities: np.ndarray | None
+        shape: (sample size, 12, 2), where 12: padded length (1d conditional Unet)
+
+    """
+    W_orig, H_orig = img.size
+
+    dw = int(desired_width)
+    dh = int(desired_height)
+
+    # margins
+    # < 0: pad / > 0: crop
+    left, right = (W_orig - dw) // 2, (W_orig + dw) // 2
+    top, bottom = (H_orig - dh) // 2, (H_orig + dh) // 2
+    
+    ax.imshow(np.array(img))
+    ax.axis('off')
+
+    # camera matrix
+    K = np.array([[fx, 0., cx], [0., fy, cy], [0., 0., 1.]])
+
+    if densities is not None:
+        cmap = plt.get_cmap('coolwarm')
+        colors = cmap(densities)
+        # colors[..., -1] = densities     # transparency proportional to density
+    else:
+        colors = np.array(to_rgba('#DB6057'))
+
+    # inference results
+    curves_pred = np.insert(pred_waypoints, 1, gt_waypoints_y, axis=-1)
+    curves_pred[..., 1] += 1.8
+    line_collection = project_curves_onto_image_plane(
+        curves_pred,
+        colors,
+        camera_matrix=K,
+        z_near=1e-3
+    )
+    ax.add_collection(line_collection)
+
+    # ground truth
+    curve_gt = np.insert(gt_waypoints, 1, gt_waypoints_y, axis=-1)
+    curve_gt[..., 1] += 1.8
+    line_collection = project_curves_onto_image_plane(
+        curve_gt,
+        colors=np.array(to_rgba('#92DB58')),
+        camera_matrix=K,
+        z_near=1e-3
+    )
+    ax.add_collection(line_collection)
+    
+    # crop/pad
+    ax.set_xlim(left, right)
+    ax.set_ylim(bottom, top)
+    return
 
 
 def project_curves_onto_image_plane(points, colors, camera_matrix, z_near=1e-2):
@@ -462,10 +449,12 @@ def project_curves_onto_image_plane(points, colors, camera_matrix, z_near=1e-2):
     # interpolation (intersection with z = z_near)
     z0, z1 = e_in[bf, -1], e_out[bf, -1]
     t = (z_near - z0) / (z1 - z0)
+    t = t[..., np.newaxis]
     e_in[bf] = (1. - t) * e_in[bf] + t * e_out[bf]
 
     z0, z1 = e_out[fb, -1], e_in[fb, -1]
     t = (z_near - z0) / (z1 - z0)
+    t = t[..., np.newaxis]
     e_out[fb] = (1. - t) * e_out[fb] + t * e_in[fb]
 
     edges_clipped = np.stack((e_in, e_out), axis=-2)    # (*, # of edges, 2, 3)
@@ -473,14 +462,14 @@ def project_curves_onto_image_plane(points, colors, camera_matrix, z_near=1e-2):
     edges_clipped = edges_clipped.reshape((-1, 2, 3))
     edges_in_front = edges_clipped[visible]
     
-    colors = np.tile(colors[..., np.newaxis, :], n_edges, axis=-2)      # (*, # of edges, 3)
-    colors = colors.reshape((-1, 3))
+    colors = np.repeat(colors[..., np.newaxis, :], n_edges, axis=-2)      # (*, # of edges, 3)
+    colors = colors.reshape((-1, 4))
     colors = colors[visible]
     points_in_front = edges_in_front.reshape((-1, 3))    # flatten
 
     # arguments: object points, rvec, tvec, camera matrix, distortion coefficients
     # image_points, _ = cv2.projectPoints(points_in_front, np.zeros(3), np.zeros(3), camera_matrix, np.zeros(5))
-    points_img = points_in_front @ K.T
+    points_img = points_in_front @ camera_matrix.T
     x_img, y_img, z_img = np.split(points_img, 3, axis=-1)
     u, v = x_img / z_img, y_img / z_img
 
