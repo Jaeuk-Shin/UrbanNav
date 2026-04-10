@@ -20,6 +20,7 @@ from pl_modules.citywalker_crop_module import CityWalkerCropModule
 from pl_modules.citywalk_crop_datamodule import CityWalkCropDataModule
 from pl_modules.flow_matching_module import FlowMatchingModule
 from pl_modules.flow_matching_feat_module import FlowMatchingFeatModule
+from pl_modules.flow_matching_feat_simple_module import FlowMatchingFeatSimpleModule
 
 import hydra
 from omegaconf import OmegaConf
@@ -89,6 +90,8 @@ def main(cfg):
         model = CityWalkerFeatModule(cfg)
     elif cfg.model.type == 'flow_matching_feat':
         model = FlowMatchingFeatModule(cfg)
+    elif cfg.model.type == 'flow_matching_feat_simple':
+        model = FlowMatchingFeatSimpleModule(cfg)
     elif cfg.model.type == 'citywalker_fm':
         model = FlowMatchingModule(cfg)
     else:

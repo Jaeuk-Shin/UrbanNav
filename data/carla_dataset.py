@@ -196,7 +196,7 @@ class CarlaDataset(Dataset):
         else:
             raise NotImplementedError(f"Coordinate embedding type {self.cfg.model.cord_embedding} not implemented")
         waypoints_transformed = self.transform_waypoints(waypoint_poses, current_pose)
-        waypooint_transformed_y = np.copy(waypoints_transformed[:, 1])      # preserve y-coordinates (for further visualization)
+        waypoint_transformed_y = np.copy(waypoints_transformed[:, 1])      # preserve y-coordinates (for further visualization)
         # Convert data to tensors
         input_positions = torch.tensor(transformed_input_positions, dtype=torch.float32)
         waypoints_transformed = torch.tensor(waypoints_transformed[:, [0, 2]], dtype=torch.float32)
@@ -260,7 +260,7 @@ class CarlaDataset(Dataset):
 
             # load the y-coordinates of the ground truth waypoints just for visualization
             # unused during training & inference
-            sample['gt_waypoints_y'] = waypooint_transformed_y
+            sample['gt_waypoints_y'] = waypoint_transformed_y
         return sample
 
     def transform_poses(self, poses, current_pose_array):
