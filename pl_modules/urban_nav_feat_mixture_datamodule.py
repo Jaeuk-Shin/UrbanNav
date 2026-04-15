@@ -47,17 +47,11 @@ class UrbanNavFeatMixtureDataModule(pl.LightningDataModule):
         cfg_dict = OmegaConf.to_container(self.cfg, resolve=True)
         data = cfg_dict['data']
 
-        root = entry['root']
-        data['root_dir'] = root
-        data['pose_dir'] = entry.get('pose_subdir', 'pose')
-        data['feature_dir'] = entry.get(
-            'feature_dir',
-            f"{root}/{entry.get('feature_subdir', 'dino')}",
-        )
-        data['rgb_dir'] = entry.get(
-            'rgb_dir',
-            f"{root}/{entry.get('rgb_subdir', 'rgb')}",
-        )
+        data['root'] = entry['root']
+        for key in ('pose_subdir', 'feature_subdir', 'feature_dir',
+                     'rgb_subdir', 'rgb_dir'):
+            if key in entry:
+                data[key] = entry[key]
 
         # Per-dataset camera intrinsics (optional)
         if 'camera' in entry:

@@ -234,7 +234,7 @@ class FlowMatchingFeatSimple(nn.Module):
         return wp_pred, v_pred, ut
 
     @torch.no_grad()
-    def sample(self, obs_features, cord, num_samples=5, num_inference_steps=10):
+    def sample(self, obs_features, cord, num_samples=5, num_inference_steps=50):
         """
         Euler ODE integration of the learned velocity field.
 

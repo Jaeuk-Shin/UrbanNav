@@ -25,9 +25,12 @@ class CarlaFeatDataset(Dataset):
         super().__init__()
         self.cfg = cfg
         self.mode = mode
-        self.data_dir = cfg.data.root_dir
-        self.pose_dir = os.path.join(self.data_dir, cfg.data.pose_dir)
-        self.feature_dir = cfg.data.feature_dir
+        self.data_dir = cfg.data.root
+        pose_subdir = getattr(cfg.data, 'pose_subdir', 'pose')
+        self.pose_dir = os.path.join(self.data_dir, pose_subdir)
+        feature_subdir = getattr(cfg.data, 'feature_subdir', 'dino')
+        self.feature_dir = getattr(cfg.data, 'feature_dir',
+                                   os.path.join(self.data_dir, feature_subdir))
         self.context_size = cfg.model.obs_encoder.context_size
         self.wp_length = cfg.model.decoder.len_traj_pred
         self.video_fps = cfg.data.video_fps
@@ -138,7 +141,9 @@ class CarlaFeatDataset(Dataset):
         # When cfg.data.rgb_dir is set (e.g. by mixture datamodule), look for
         # frame directories at {rgb_dir}/{episode_name}/.  Otherwise fall back
         # to the legacy CARLA layout: {root_dir}/{episode_name}/fcam/.
-        rgb_dir = getattr(cfg.data, 'rgb_dir', None)
+        rgb_subdir = getattr(cfg.data, 'rgb_subdir', 'rgb')
+        rgb_dir = getattr(cfg.data, 'rgb_dir',
+                          os.path.join(self.data_dir, rgb_subdir))
         self.image_dirs = []
         for pp in self.pose_path:
             name = os.path.splitext(os.path.basename(pp))[0]

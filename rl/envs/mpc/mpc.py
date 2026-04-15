@@ -97,7 +97,8 @@ class MPC:
 
             # objective
             # prioritize reaching the first waypoint
-            cost_weight = 5. if t <= 0 else 1.
+
+            # cost_weight = 5. if t <= 0 else 1.
             objective += p[dx+2*ts+t] * ca.sumsqr(pos_t_next - p[dx+2*t:dx+2*(t+1)]) ** 2 + 1e-4 * ca.sumsqr(u) ** 2
 
         # Flatten constraints

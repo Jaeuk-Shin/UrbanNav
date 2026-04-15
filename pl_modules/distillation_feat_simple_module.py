@@ -7,14 +7,14 @@ import matplotlib.pyplot as plt
 import pytorch_lightning as pl
 from omegaconf import OmegaConf
 from PIL import Image
-from pl_modules.flow_matching_feat_module import FlowMatchingFeatModule
-from model.flow_matching_feat_distilled import DistilledFeatMLP
+from pl_modules.flow_matching_feat_simple_module import FlowMatchingFeatSimpleModule
+from model.flow_matching_feat_simple_distilled import DistilledFeatSimpleMLP
 from vis_utils import project_waypoints_onto_image_plane
 
 matplotlib.use('Agg')
 
 
-class DistillationFeatModule(pl.LightningModule):
+class DistillationFeatSimpleModule(pl.LightningModule):
     """
     Feature-based distillation module that distills a FlowMatchingFeat teacher
     into a ResidualMLP student using precomputed DINOv2 features.
@@ -30,16 +30,16 @@ class DistillationFeatModule(pl.LightningModule):
 
         if teacher_checkpoint_path is not None:
             # Load teacher from FlowMatchingFeatModule checkpoint
-            fm_module = FlowMatchingFeatModule.load_from_checkpoint(
+            fm_module = FlowMatchingFeatSimpleModule.load_from_checkpoint(
                 teacher_checkpoint_path, cfg=cfg
             )
             teacher_model = fm_module.model
         else:
             # Create teacher architecture from cfg; weights will be loaded
             # from the distillation checkpoint's state_dict.
-            from model.flow_matching_feat import FlowMatchingFeat
-            teacher_model = FlowMatchingFeat(cfg)
-        self.model = DistilledFeatMLP(teacher_model)
+            from model.flow_matching_feat_simple import FlowMatchingFeatSimple
+            teacher_model = FlowMatchingFeatSimple(cfg)
+        self.model = DistilledFeatSimpleMLP(teacher_model)
 
         self.val_num_visualize = cfg.validation.num_visualize
         self.test_num_visualize = cfg.testing.num_visualize
@@ -61,16 +61,16 @@ class DistillationFeatModule(pl.LightningModule):
         num_steps = self.num_inference_steps
 
         with torch.no_grad():
-            xt = F.pad(noise, (0, 0, 0, 12 - noise.size(1)))
+            xt = noise.clone()
             dt = 1.0 / num_steps
             for i in range(num_steps):
                 t_curr = i / num_steps
-                t_tensor = torch.full((B,), t_curr * 1000, device=xt.device)
+                t_tensor = torch.full((B,), t_curr, device=xt.device)
                 v_pred = self.model.teacher.wp_predictor(
                     sample=xt, timestep=t_tensor, global_cond=dec_out
                 )
                 xt = xt + v_pred * dt
-            teacher_targets = xt[:, :self.model.len_traj_pred]
+            teacher_targets = xt
 
         distill_loss = F.mse_loss(student_deltas, teacher_targets)
         self.log('train/distill_loss', distill_loss, prog_bar=True, sync_dist=True)
@@ -89,16 +89,16 @@ class DistillationFeatModule(pl.LightningModule):
         B = student_deltas.size(0)
 
         with torch.no_grad():
-            xt = F.pad(noise, (0, 0, 0, 12 - noise.size(1)))
+            xt = noise.clone()
             dt = 1.0 / num_steps
             for i in range(num_steps):
                 t_curr = i / num_steps
-                t_tensor = torch.full((B,), t_curr * 1000, device=xt.device)
+                t_tensor = torch.full((B,), t_curr, device=xt.device)
                 v_pred = self.model.teacher.wp_predictor(
                     sample=xt, timestep=t_tensor, global_cond=dec_out
                 )
                 xt = xt + v_pred * dt
-            teacher_targets = xt[:, :self.model.len_traj_pred]
+            teacher_targets = xt
 
         distill_loss = F.mse_loss(student_deltas, teacher_targets)
 

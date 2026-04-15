@@ -1,0 +1,80 @@
+checkpoint: null
+perturbation: null
+
+project:
+  name: 'distill'
+  run_name: 'carla_feat_distill_simple'
+  result_dir: 'distill0414'
+
+training:
+  batch_size: 512
+  max_epochs: 20
+  gpus: 1
+  amp: true
+  normalize_step_length: true
+  resume: false
+  direction_loss_weight: 5.0
+  feature_loss_weight: 0.1
+
+scheduler:
+  name: 'cosine'
+  step_size: 10
+  gamma: 0.1
+
+optimizer:
+  name: 'adamw'
+  lr: 2e-4
+
+model:
+  type: 'flow_matching_feat_simple'
+  do_rgb_normalize: true
+  do_resize: true
+  obs_encoder:
+    type: 'dinov2_vitb14'
+    context_size: 5
+    crop: [350, 630]
+    resize: [350, 630]
+    freeze: true
+  output_coordinate_repr: 'euclidean'
+
+  cord_embedding:
+    type: 'input_target'
+    num_freqs: 6
+    include_input: true
+
+  encoder_feat_dim: 768
+
+  decoder:
+    type: 'flow_matching'
+    len_traj_pred: 5
+    num_heads: 8
+    num_layers: 16
+    ff_dim_factor: 4
+    num_diffusion_iters: 100
+
+data:
+  type: carla_feat
+  root: '/home3/rvl/dataset/carla/v0.1'
+  num_workers: 32
+  pose_fps: 2
+  video_fps: 2
+  target_fps: 1
+  num_train: 1400
+  num_val: 50
+  num_test: 0
+  input_noise: 0.1
+  width: 640
+  height: 480
+  fov: 110.0
+  desired_width: 640
+  desired_height: 360
+  horizontal_flip_prob: 0.5
+
+validation:
+  num_visualize: 400
+testing:
+  num_visualize: 400
+
+logging:
+  enable_wandb: true
+  pbar_rate: 100

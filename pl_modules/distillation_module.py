@@ -15,15 +15,21 @@ matplotlib.use('Agg')
 
 
 class DistillationModule(pl.LightningModule):
-    def __init__(self, cfg, teacher_checkpoint_path):
+    def __init__(self, cfg, teacher_checkpoint_path=None):
         super().__init__()
         self.cfg = cfg
         self.save_hyperparameters(OmegaConf.to_container(cfg, resolve=True))
         self.do_normalize = cfg.training.normalize_step_length
-        # Load teacher from checkpoint
-        # No longer needed: DictNamespace serialization workaround removed
-        fm_module = FlowMatchingModule.load_from_checkpoint(teacher_checkpoint_path, cfg=cfg)
-        self.model = DistilledMLP(fm_module.model)
+        if teacher_checkpoint_path is not None:
+            # Load teacher from checkpoint (used during distillation training)
+            fm_module = FlowMatchingModule.load_from_checkpoint(teacher_checkpoint_path, cfg=cfg)
+            teacher_model = fm_module.model
+        else:
+            # Create teacher architecture from cfg; weights will be loaded
+            # from the distillation checkpoint's state_dict.
+            from model.flow_matching import FlowMatchingTrajectorySampler
+            teacher_model = FlowMatchingTrajectorySampler(cfg)
+        self.model = DistilledMLP(teacher_model)
         
         # Visualization settings
         self.val_num_visualize = cfg.validation.num_visualize

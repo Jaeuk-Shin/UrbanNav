@@ -40,15 +40,15 @@ from rl.envs.mpc.mpc import MPC
 def _solve_single(wp_np, mpc_horizon, dt, n_skips, max_speed):
     """Solve MPC for a single waypoint set (runs in worker process)."""
     ulb = np.array([-max_speed, -0.8])
-    uub = np.array([max_speed, 0.8])
+    uub = np.array([ max_speed,  0.8])
     mpc = _solve_single._mpc
     if mpc is None:
         mpc = MPC(mpc_horizon, dt, ulb, uub, max_wall_time=2.0 * dt)
         _solve_single._mpc = mpc
 
     wp_up = np.repeat(wp_np, n_skips, axis=0)[:mpc_horizon]
-    cw = np.ones(mpc_horizon)
-    cw[:n_skips] = 10.0
+    cw = np.zeros(mpc_horizon)
+    cw[n_skips-1::n_skips] = 1.0
     initial_pose = np.array([0.0, 0.0, np.pi / 2.0])
     try:
         _, _, stats = mpc.solve(initial_pose, wp_up, cw)
@@ -91,12 +91,12 @@ def evaluate_mpc_batch(wp_batch_np, mpc_horizon, dt, n_skips, max_speed,
     return np.array(costs, dtype=np.float32)
 
 
-# ── Frozen encoder helper ───────────────────────────────────────────────
+# ── Frozen encoder helpers ──────────────────────────────────────────────
 
 
 @torch.no_grad()
 def encode_context(distilled_model, obs, cord):
-    """Run the frozen teacher encoder and return dec_out (B, feat_dim)."""
+    """Run the frozen image-based teacher encoder and return dec_out (B, feat_dim)."""
     import torchvision.transforms.functional as TF
 
     teacher = distilled_model.teacher
@@ -119,12 +119,26 @@ def encode_context(distilled_model, obs, cord):
     return dec_out
 
 
+@torch.no_grad()
+def encode_context_feat(distilled_model, obs_features, cord):
+    """Run the frozen feature-based teacher encoder and return dec_out (B, feat_dim)."""
+    teacher = distilled_model.teacher
+    B = obs_features.shape[0]
+    obs_enc = teacher.compress_obs_enc(obs_features)
+    cord_enc = teacher.cord_embedding(cord).view(B, -1)
+    cord_enc = teacher.compress_goal_enc(cord_enc).view(B, 1, -1)
+    tokens = torch.cat([obs_enc, cord_enc], dim=1)
+    tokens = teacher.positional_encoding(tokens)
+    return teacher.sa_decoder(tokens).mean(dim=1)
+
+
 # ── Training step ───────────────────────────────────────────────────────
 
 
 def train_step(proposal, distilled_model, dec_out, optimizer,
                beta, num_samples, mpc_horizon, dt, n_skips, max_speed,
-               baseline_state, baseline_ema, pool, device):
+               baseline_state, baseline_ema, pool, device,
+               noise_traj_len=12):
     """
     One gradient step of the noise-space variational tilting.
 
@@ -139,7 +153,7 @@ def train_step(proposal, distilled_model, dec_out, optimizer,
     # z: (B, K, 24), log_q: (B, K), kl: (B,)
 
     # 2. Generate trajectories through frozen generator
-    z_flat = z.view(B * K, 12, 2)
+    z_flat = z.view(B * K, noise_traj_len, 2)
     dec_rep = dec_out.unsqueeze(1).expand(-1, K, -1).reshape(B * K, -1)
 
     with torch.no_grad():
@@ -187,7 +201,8 @@ def train_step(proposal, distilled_model, dec_out, optimizer,
 @torch.no_grad()
 def validate(proposal, distilled_model, val_loader, beta,
              num_samples, mpc_horizon, dt, n_skips, max_speed,
-             pool, device, max_batches=20):
+             pool, device, max_batches=20,
+             use_feat=False, noise_traj_len=12):
     """Compute mean tilted loss and cost on validation data."""
     proposal.eval()
     total_kl, total_cost, count = 0.0, 0.0, 0
@@ -197,13 +212,17 @@ def validate(proposal, distilled_model, val_loader, beta,
     for i, batch in enumerate(val_loader):
         if i >= max_batches:
             break
-        obs = batch["video_frames"].to(device)
         cord = batch["input_positions"].to(device)
-        dec_out = encode_context(distilled_model, obs, cord)
+        if use_feat:
+            obs_features = batch["obs_features"].to(device)
+            dec_out = encode_context_feat(distilled_model, obs_features, cord)
+        else:
+            obs = batch["video_frames"].to(device)
+            dec_out = encode_context(distilled_model, obs, cord)
         B = dec_out.shape[0]
 
         z, log_q, kl = proposal(dec_out, num_samples=K)
-        z_flat = z.view(B * K, 12, 2)
+        z_flat = z.view(B * K, noise_traj_len, 2)
         dec_rep = dec_out.unsqueeze(1).expand(-1, K, -1).reshape(B * K, -1)
         deltas = distilled_model.forward_student(dec_rep, z_flat)
         wp = torch.cumsum(deltas, dim=1)
@@ -246,7 +265,7 @@ def parse_args():
     p.add_argument("--baseline_ema", type=float, default=0.99,
                    help="EMA decay for REINFORCE baseline")
     # MPC parameters
-    p.add_argument("--n_skips", type=int, default=4,
+    p.add_argument("--n_skips", type=int, default=5,
                    help="Sub-steps per waypoint for MPC horizon upsampling")
     p.add_argument("--dt", type=float, default=0.2,
                    help="MPC simulation timestep")
@@ -286,12 +305,29 @@ def main():
     ckpt_dir = os.path.join(result_dir, "checkpoints")
     os.makedirs(ckpt_dir, exist_ok=True)
 
+    # ── Determine model variant ──
+    data_type = cfg.data.type
+    model_type = cfg.model.type
+    use_feat = data_type in ('carla_feat', 'urban_nav_feat_mixture')
+
     # ── Load distilled model (frozen) ──
     print(f"Loading distilled model from {args.distill_ckpt}")
-    from pl_modules.distillation_module import DistillationModule
-    distill_module = DistillationModule.load_from_checkpoint(
-        args.distill_ckpt, cfg=cfg
-    )
+    if use_feat:
+        if model_type == 'flow_matching_feat_simple':
+            from pl_modules.distillation_feat_simple_module import DistillationFeatSimpleModule
+            distill_module = DistillationFeatSimpleModule.load_from_checkpoint(
+                args.distill_ckpt, cfg=cfg
+            )
+        else:
+            from pl_modules.distillation_feat_module import DistillationFeatModule
+            distill_module = DistillationFeatModule.load_from_checkpoint(
+                args.distill_ckpt, cfg=cfg
+            )
+    else:
+        from pl_modules.distillation_module import DistillationModule
+        distill_module = DistillationModule.load_from_checkpoint(
+            args.distill_ckpt, cfg=cfg
+        )
     distilled_model = distill_module.model
     distilled_model.eval()
     for p in distilled_model.parameters():
@@ -300,7 +336,14 @@ def main():
 
     encoder_feat_dim = distilled_model.teacher.encoder_feat_dim
     len_traj_pred = distilled_model.len_traj_pred
-    print(f"  encoder_feat_dim={encoder_feat_dim}, len_traj_pred={len_traj_pred}")
+    # Simple models don't zero-pad; UNet-based models pad noise to 12 timesteps
+    if model_type == 'flow_matching_feat_simple':
+        noise_traj_len = len_traj_pred
+    else:
+        noise_traj_len = 12
+    noise_dim = noise_traj_len * 2
+    print(f"  encoder_feat_dim={encoder_feat_dim}, len_traj_pred={len_traj_pred}, "
+          f"noise_dim={noise_dim}")
 
     # ── MPC parameters ──
     mpc_horizon = len_traj_pred * args.n_skips
@@ -308,21 +351,27 @@ def main():
     # ── Noise proposal ──
     proposal = NoiseProposal(
         context_dim=encoder_feat_dim,
-        noise_dim=24,
+        noise_dim=noise_dim,
         hidden_dim=args.hidden_dim,
     ).to(device)
     optimizer = torch.optim.Adam(proposal.parameters(), lr=args.lr)
     print(f"  NoiseProposal params: {sum(p.numel() for p in proposal.parameters()):,}")
 
     # ── Data ──
-    if cfg.data.type == "carla":
+    if data_type == "carla":
         from pl_modules.carla_datamodule import CarlaDataModule
         datamodule = CarlaDataModule(cfg)
-    elif cfg.data.type == "citywalk":
+    elif data_type == "citywalk":
         from pl_modules.citywalk_datamodule import CityWalkDataModule
         datamodule = CityWalkDataModule(cfg)
+    elif data_type == "carla_feat":
+        from pl_modules.carla_feat_datamodule import CarlaFeatDataModule
+        datamodule = CarlaFeatDataModule(cfg)
+    elif data_type == "urban_nav_feat_mixture":
+        from pl_modules.urban_nav_feat_mixture_datamodule import UrbanNavFeatMixtureDataModule
+        datamodule = UrbanNavFeatMixtureDataModule(cfg)
     else:
-        raise ValueError(f"Unknown data type: {cfg.data.type}")
+        raise ValueError(f"Unknown data type: {data_type}")
 
     datamodule.setup(stage="fit")
     train_loader = datamodule.train_dataloader()
@@ -375,11 +424,15 @@ def main():
         epoch_costs = []
 
         for batch_idx, batch in enumerate(train_loader):
-            obs = batch["video_frames"].to(device)
             cord = batch["input_positions"].to(device)
 
             # Encode context (frozen)
-            dec_out = encode_context(distilled_model, obs, cord)
+            if use_feat:
+                obs_features = batch["obs_features"].to(device)
+                dec_out = encode_context_feat(distilled_model, obs_features, cord)
+            else:
+                obs = batch["video_frames"].to(device)
+                dec_out = encode_context(distilled_model, obs, cord)
 
             metrics = train_step(
                 proposal, distilled_model, dec_out, optimizer,
@@ -393,6 +446,7 @@ def main():
                 baseline_ema=args.baseline_ema,
                 pool=pool,
                 device=device,
+                noise_traj_len=noise_traj_len,
             )
             epoch_costs.append(metrics["mean_cost"])
             global_step += 1
@@ -418,6 +472,7 @@ def main():
                     mpc_horizon=mpc_horizon, dt=args.dt,
                     n_skips=args.n_skips, max_speed=args.max_speed,
                     pool=pool, device=device,
+                    use_feat=use_feat, noise_traj_len=noise_traj_len,
                 )
                 print(
                     f"  ── val: kl={val_metrics['val/kl']:.4f}  "

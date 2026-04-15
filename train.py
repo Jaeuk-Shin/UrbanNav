@@ -10,6 +10,7 @@ from pl_modules.carla_datamodule import CarlaDataModule
 from pl_modules.carla_feat_datamodule import CarlaFeatDataModule
 from pl_modules.citywalk_feat_datamodule import CityWalkFeatDataModule
 from pl_modules.urban_nav_feat_mixture_datamodule import UrbanNavFeatMixtureDataModule
+from pl_modules.filtered_feat_datamodule import FilteredFeatDataModule
 from pytorch_lightning.strategies import DDPStrategy
 import torch
 import glob
@@ -76,6 +77,8 @@ def main(cfg):
         datamodule = CityWalkFeatDataModule(cfg)
     elif cfg.data.type == 'urban_nav_feat_mixture':
         datamodule = UrbanNavFeatMixtureDataModule(cfg)
+    elif cfg.data.type == 'filtered_feat':
+        datamodule = FilteredFeatDataModule(cfg)
     else:
         raise ValueError(f"Invalid dataset: {cfg.data.dataset}")
 

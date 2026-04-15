@@ -1,0 +1,22 @@
+(urban-nav) rvl@ad-labs-intern-3:~/UrbanNav$ python analysis/linear_probe.py --config config/urban_nav_feat.yaml --max_episodes 0 --max_frames_per_episode 0
+Loading features ...
+Loading episodes: 100%|██████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 1488/1488 [00:07<00:00, 193.69it/s]
+  [v0.1] 178,043 frames from 1488 episodes  (dim=768)
+Loading episodes: 100%|███████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 176840/176840 [33:24<00:00, 88.22it/s]
+  [youtube_videos] 21,682,396 frames from 176802 episodes  (dim=768)
+
+Balancing: 178043 vs 21682396 → 178043 each
+
+=======================================================
+  Linear Probe  —  Domain Separability Test
+=======================================================
+  Datasets      : v0.1 vs youtube_videos
+  Samples/class : 178,043
+  Feature dim   : 768
+  5-fold CV acc  : 1.0000 ± 0.0000
+  ROC-AUC       : 1.0000
+  Per-fold accs : ['1.0000', '1.0000', '1.0000', '1.0000', '1.0000']
+=======================================================
+  → CLEARLY SEPARABLE  — large domain gap
+
+
