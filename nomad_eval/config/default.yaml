@@ -1,0 +1,45 @@
+# ── NoMaD evaluation config ────────────────────────────────────────────
+
+# Path to the NoMaD checkpoint (download from the visualnav-transformer
+# release page: https://drive.google.com/drive/folders/1a9yWR2iooXFAqjQHetz263--4_2FFggg)
+# and the model config that was used at training time.
+nomad:
+  ckpt_path: /home3/rvl/baselines/visualnav-transformer/deployment/model_weights/nomad.pth
+  config_path: /home3/rvl/baselines/visualnav-transformer/train/config/nomad.yaml
+  num_samples: 8         # diffusion samples per step
+  waypoint_idx: 2        # which future waypoint to execute (matches navigate.py default)
+  radius: 4              # temporal localization window
+  close_threshold: 3     # advance subgoal when predicted dist < this
+
+# ── CARLA connection ───────────────────────────────────────────────────
+carla:
+  port: 2000
+  fps: 5                 # world tick rate (matches CarlaMultiAgentEnv default)
+  n_skips: 1             # ticks per policy step
+  teleport: false        # false → use WalkerControl
+  max_speed: 1.4         # m/s; caps the commanded velocity
+  success_radius: 2.0    # metres to consider the goal reached
+
+# ── Episode ────────────────────────────────────────────────────────────
+episode:
+  # Start transform (UE coordinates). If null, sampled near the map origin.
+  start_ue: [0.0, 0.0, 1.0]      # [x, y, z]
+  start_yaw_deg: 0.0
+  # Goal transform (UE). Distance should be on the order of 100 m.
+  goal_ue: [100.0, 0.0, 1.0]
+  max_steps: 400
+
+# ── Topomap ────────────────────────────────────────────────────────────
+topomap:
+  planner_resolution_m: 2.0    # CARLA GRP waypoint spacing (dense)
+  min_spacing_m: 3.0           # sparsified spacing between topomap nodes
+  include_start: true
+  ground_z_ue: null            # if null, keep current z during capture
+  save_dir: null               # if set, dumps topomap images to this folder
+
+# ── Control ────────────────────────────────────────────────────────────
+# NoMaD was trained with normalize=True, so waypoints are in unit-ish
+# deltas.  At deployment they are scaled by MAX_V / RATE (see navigate.py).
+# "RATE" here is the policy step rate = fps / n_skips.
+control:
+  max_v: 1.4                   # matches MAX_V in the LoCoBot deployment config

@@ -1,0 +1,59 @@
+# Default configuration for CityWalker CARLA navigation test.
+#
+# The `model.*` and `data.*` blocks mirror the YAML used to train CityWalker
+# (they must match the checkpoint — `context_size`, `len_traj_pred`, and image
+# dims are load-bearing). `carla.*` and `test.*` are local to this harness.
+
+model:
+  type: 'citywalker_feat'          # 'citywalker' or 'citywalker_feat'
+  do_rgb_normalize: true
+  do_resize: true
+  obs_encoder:
+    type: 'dinov2_vitb14'
+    context_size: 5
+    crop: [350, 630]
+    resize: [350, 630]
+    freeze: true
+  output_coordinate_repr: 'euclidean'
+  cord_embedding:
+    type: 'input_target'
+    num_freqs: 6
+    include_input: true
+  encoder_feat_dim: 768
+  decoder:
+    type: 'attention'
+    len_traj_pred: 5
+    num_heads: 8
+    num_layers: 16
+    ff_dim_factor: 4
+
+data:
+  # Only the fields CarlaMultiAgentEnv reads are required here.
+  target_fps: 1                     # policy control rate (Hz)
+  width: 640                        # camera width  (must match sensor spec)
+  height: 480                       # camera height (must match sensor spec)
+
+training:
+  normalize_step_length: true       # must match the checkpoint
+
+carla:
+  host: '127.0.0.1'
+  port: 2000
+  fps: 5                            # world tick rate
+  max_speed: 1.4                    # m/s — walker cap
+  teleport: false                   # true = kinematic teleport; false = physics
+  use_mpc: false
+  towns: ['Town02']                 # list; first entry is used
+  max_episode_steps: 500
+  scenario_dir: null                # REQUIRED — path to precomputed scenarios
+
+test:
+  goal_distance: 100.0              # metres from start
+  goal_tolerance: 15.0              # accept goals within ±tolerance
+  subgoal_spacing: 8.0              # metres of arc length between subgoals
+  path_resolution: 2.0              # GlobalRoutePlanner sampling (m)
+  reach_threshold: 2.0              # advance subgoal when within this (m)
+  final_threshold: 1.0              # declare arrival when within this of goal
+  step_scale: 1.0                   # CityWalker metric normalizer
+  max_steps: 400                    # safety cap on rollout length
+  seed: 0                           # rng seed for goal sampling
